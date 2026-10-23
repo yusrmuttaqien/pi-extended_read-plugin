@@ -78,4 +78,4 @@ Zero new heavy dependencies by default (bundled ffmpeg + mupdf WASM + Photon onl
 
 ## Git & PR flow
 
-Commits land on `main`. Feature work can branch and merge via PR; `gh` CLI is unavailable here — use the GitHub API (`curl`) with a token from `git credential fill`. New features ship as `feat:`; docs-only follow-ups as `docs:`; lockfile refreshes as `chore:`.
+Commits land on `main`. Feature work can branch and merge via PR; `gh` CLI is unavailable here — use the GitHub API (`curl`) with a token from `git credential fill`. New features ship as `feat:`; docs-only follow-ups as `docs:`; lockfile refreshes as `chore:`. The implementation branch plan (order + status) lives in `PLAN.md` — keep it current as branches land.
