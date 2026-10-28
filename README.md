@@ -35,19 +35,11 @@ Direct formats (png, jpg, jpeg, gif, webp, bmp) are read in-memory. Converted fo
 | `extendedRead path="photo.png"` | Full image (direct format) |
 | `extendedRead path="photo.heic"` | Converted to PNG via ffmpeg |
 | `extendedRead path="photo.png" zoom='{x:0,y:0,w:0.5,h:0.5}'` | Magnify upper-left quadrant |
-| `extendedRead path="photo.png" grid='{rows:3,cols:4}'` | 3×4 grid of sharp per-cell crops |
-| `extendedRead path="photo.png" grid='{rows:3,cols:4,region:{x:0,y:0.2,w:1,h:0.6}}'` | Grid over a sub-region |
-| `extendedRead path="photo.png" locate='{rows:4,cols:4}'` | 4×4 tiling with 15% overlap |
-| `extendedRead path="photo.png" locate='{rows:4,cols:4,overlap:0.2}'` | 4×4 tiling with 20% overlap |
 | `extendedRead path="photo.png" info=true` | Metadata text (size, format, dimensions) — no image loaded |
 
-**Region-finding tools** (work on any image format, direct, converted, and PDF image mode):
+**Region tools** (work on any image format, direct, converted, and PDF image mode):
 
 - **`zoom`** — crop + scale a rectangular region. Normalized `[x, y, w, h]` fractions 0–1 of the image.
-- **`grid`** — tile a region into a regular grid of sharp per-cell crops. Each cell carries its exact `zoom={...}` hint for follow-up. Use when the layout is known (card grids, tables).
-- **`locate`** — coarse-to-fine tiling with overlap. The tool tiles a region into overlapping tiles (default 4×4, 15% overlap), the model picks the tile containing the target, then drills in with `zoom`. Use when the target location is unknown.
-
-Cap: 49 cells/tiles per call.
 
 ## Video reading
 
@@ -75,8 +67,6 @@ Text extraction, visual rendering, table of contents, and text search via mupdf 
 | `extendedRead path="doc.pdf" mode="image" pages="3,7"` | PNG of pages 3 and 7 |
 | `extendedRead path="doc.pdf" mode="image" dpi=300` | PNG at 300 DPI |
 | `extendedRead path="doc.pdf" mode="image" zoom='{x:0,y:0,w:0.5,h:0.5}'` | Magnify upper-left quadrant |
-| `extendedRead path="doc.pdf" mode="image" grid='{rows:3,cols:4}'` | 3×4 grid of sharp per-cell crops |
-| `extendedRead path="doc.pdf" mode="image" locate='{rows:4,cols:4}'` | 4×4 tiling with 15% overlap |
 | `extendedRead path="doc.pdf" toc=true` | Table of contents/outline |
 | `extendedRead path="doc.pdf" search="quarterly revenue"` | Pages matching query |
 

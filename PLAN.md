@@ -6,7 +6,7 @@ Execution tracker for the future work defined in **SPEC.md §14**. The SPEC is t
 
 | # | Branch | Contains | Status |
 |---|--------|----------|--------|
-| 1 | `purge-grid-locate` | Purge `grid` + `locate`: params, `src/region.ts`, dispatch branches, tests, docs. Prerequisite for trace. | pending |
+| 1 | `purge-grid-locate` | Purge `grid` + `locate`: params, `src/region.ts`, dispatch branches, tests, docs. Prerequisite for trace. | in progress |
 | 2 | `patch-eviction` | Patch eviction: ffmpeg gate → video-as-frames → audio out → JPEG standardization → delete `src/patch/` + `/extended-read-patch`. End state: patch-free. | pending |
 | 3 | `trace` | Trace (region-finding v2): numbered overlay + crop-from-untraced-original, 0-100 coords, split-for-legibility, temp reuse, `/extended-read-clean`, per-session temp dir. | pending |
 | 4 | `docx` | DOCX reader (`mammoth`). | pending |
