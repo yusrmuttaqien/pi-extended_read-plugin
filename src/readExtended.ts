@@ -8,7 +8,6 @@
  * Dispatch delegates to specialized modules:
  *   - ffmpeg.ts  — format conversion, region cropping, dimension probing
  *   - image.ts   — pi's Photon resize pipeline
- *   - region.ts  — grid + locate (region-finding tools)
  *   - pdf.ts     — mupdf text/image extraction
  *   - pptx.ts    — PPTX → PDF conversion
  */
@@ -22,7 +21,6 @@ import { resolveModelConfig } from "./config.js";
 import { ffmpegConvert, probeMedia, renderProbeText } from "./ffmpeg.js";
 import { processImageBytes } from "./image.js";
 import { cropRegionToPng, ZOOM_UNAVAILABLE_HINT } from "./ffmpeg.js";
-import { renderGrid, renderLocate } from "./region.js";
 import { readPdf } from "./pdf.js";
 import { readPptx } from "./pptx.js";
 
@@ -100,10 +98,6 @@ export interface ExtendedReadParams {
 	dpi?: number;
 	/** Crop + scale a rectangular region on any image — direct formats (png,jpg,gif,webp,bmp), converted formats (heic,tiff,tif,avif,...) and PDF image mode. Normalized [x,y,w,h] fractions 0–1 of the bounding box; omit for full frame. */
 	zoom?: { x: number; y: number; w: number; h: number };
-	/** Tile a region into a regular rows×cols grid of sharp per-cell crops, each with its exact normalized bbox + a ready-to-use zoom hint. */
-	grid?: { rows: number; cols: number; region?: { x: number; y: number; w: number; h: number } };
-	/** Coarse-to-fine tiling with overlap: tile a region into rows×cols sharp tiles, each extended into its neighbor by `overlap` fraction so targets on tile boundaries are fully inside at least one tile. */
-	locate?: { rows?: number; cols?: number; overlap?: number; region?: { x: number; y: number; w: number; h: number } };
 	/** Metadata-only first look (size, duration, dimensions, audio streams) on ffmpeg-decodable media — no media loaded. */
 	info?: boolean;
 }
@@ -224,10 +218,6 @@ export async function readExtended(
 			return {
 				content: [{ type: "text", text: "Model does not support images" }],
 			};
-		if (params.grid)
-			return { content: await renderGrid(path, params.grid, config) };
-		if (params.locate)
-			return { content: await renderLocate(path, params.locate, config) };
 		const bytes: Buffer = await readFile(path);
 		return processImageContent(bytes, IMAGE_DIRECT[ext], params.zoom, path, config.defaults.ffmpegTimeoutMs);
 	}
@@ -240,10 +230,6 @@ export async function readExtended(
 			};
 		const tmp = await ffmpegConvert(path, "png", config.defaults.ffmpegTimeoutMs);
 		try {
-			if (params.grid)
-				return { content: await renderGrid(tmp, params.grid, config) };
-			if (params.locate)
-				return { content: await renderLocate(tmp, params.locate, config) };
 			const bytes: Buffer = await readFile(tmp);
 			return processImageContent(bytes, "image/png", params.zoom, tmp, config.defaults.ffmpegTimeoutMs);
 		} finally {

@@ -10,14 +10,13 @@ src/readExtended.ts dispatch spine + format maps (IMAGE_DIRECT/CONVERT, AUDIO_*,
 src/config.ts       config.json types + defaults; userConfigPath()
 src/ffmpeg.ts       ffmpeg helpers: convert, crop, dims, probe (parseFfmpegProbe/probeMedia/renderProbeText), ZOOM_UNAVAILABLE_HINT
 src/image.ts        processImageBytes (wraps pi's Photon pipeline)
-src/region.ts       grid + locate math, renderTiles, validateTileParams, GRID_MAX_CELLS
-src/pdf.ts          PDF text/pages/toc/search/image mode (+grid/locate on first page); PdfParams carries all params
+src/pdf.ts          PDF text/pages/toc/search/image mode (+zoom on first page); PdfParams carries all params
 src/pptx.ts         PPTX → PDF via @s8fy/pptx-converter, delegates to pdf.ts
 src/patch/targets.ts  patch anchors; src/patch/index.ts applies them + /extended-read-patch
 test/readExtended.test.ts  unit tests (pure parsers, tile math, routing)
 ```
 
-Dependency DAG: `ffmpeg → image → region → pdf → pptx → readExtended`. No cycles. New code goes into the module that owns its job; a new concern gets its own file and an entry in SPEC §9.
+Dependency DAG: `ffmpeg → image → pdf → pptx → readExtended`. No cycles. New code goes into the module that owns its job; a new concern gets its own file and an entry in SPEC §9.
 
 ## Update matrix — change type ⇒ files to touch
 
@@ -29,7 +28,6 @@ Dependency DAG: `ffmpeg → image → region → pdf → pptx → readExtended`.
 | New capability/format/modality | format maps in `readExtended.ts`; SPEC §1 goal bullets, §6 format matrix + pipeline subsection, §9 structure if a file is added; README intro capability list + modality table row(s); tests. Move the item out of SPEC §14 (Future work) when implemented. |
 | Config knob | `src/config.ts` types+defaults, repo `config.json` **values and `$docs` entries** (self-documenting), SPEC §3 defaults block, README Configuration section; default/parse tests. |
 | ffmpeg pipeline (probe/crop/convert) | `src/ffmpeg.ts`; SPEC §6 relevant subsection (+§7 wire format only if serialization changes); live smoke below. |
-| grid/locate math or rendering | `src/region.ts` constants + compute functions; model-facing param descriptions in `src/index.ts` and `PdfParams` (state the 49-cell cap, overlap default); README rows for grid/locate (Image + PDF tables); SPEC §6 region-finding bullets; tile-math tests. |
 | Pi patch target | `src/patch/targets.ts`; PATCHES.md table; SPEC §8 targets table; sentinel version bump on anchor change; `test/patch.test.ts`. |
 | Model-facing text only (guidance) | the `promptGuidelines` bullets in `src/index.ts` (≤6); tool description + param descriptions carry mechanics. Do not add a skill — see steering rules below. |
 | Model-facing result notes (steering text in tool output) | owning module — notes live in dispatch code (`readExtended.ts`, `pdf.ts`), not in `index.ts`. These strings are the model's only window into config (capability gate, size cap, pagination) and the discovery path for escape hatches: when a new option lands (e.g. `frames=N`), update the dead-end notes to steer to it. Tests pin note wording. |
@@ -39,7 +37,6 @@ Dependency DAG: `ffmpeg → image → region → pdf → pptx → readExtended`.
 ## Canonical facts that must agree everywhere
 
 - Size caps, dpi, maxPagesPerCall, ffmpegTimeoutMs: identical numbers in `src/config.ts` defaults, repo `config.json` values **and** its `$docs` text, SPEC §3 block, README Configuration section.
-- `GRID_MAX_CELLS = 49`: `region.ts`, every param description that states the cap (grid and locate share it), SPEC region-finding bullets.
 - Patch targets: one table lives in `src/patch/targets.ts`; copies must match in PATCHES.md, SPEC §8, README Pi patches section (same count of targets).
 - `ZOOM_UNAVAILABLE_HINT` has a single source (`ffmpeg.ts`); import it, never re-inline the wording.
 - Capability summary: README intro list == GitHub repo description == tool description. Update all three when modality support changes.
@@ -74,7 +71,7 @@ Guidance must be unconditional: short `promptGuidelines` bullets (≤6) in `src/
 
 ## Design constraints
 
-Zero new heavy dependencies by default (bundled ffmpeg + mupdf WASM + Photon only). No CV/ML deps: region finding stays CPU tiling (`grid` for known layouts, `locate` coarse-to-fine with overlap). A detector power mode (CLIP via Transformers.js) is future work — needs explicit opt-in config.
+Zero new heavy dependencies by default (bundled ffmpeg + mupdf WASM + Photon only). No CV/ML deps: region handling stays an ffmpeg crop (`zoom`); region-finding v2 (trace) is future work (SPEC §14) — needs explicit design sign-off.
 
 ## Git & PR flow
 

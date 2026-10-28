@@ -109,8 +109,6 @@ defineTool({
     search: Type.Optional(Type.String({ description: "PDF: search for text (case-insensitive), returns matching pages with context" })),
     dpi: Type.Optional(Type.Number({ description: "PDF: DPI for image mode (72-600, default from config)" })),
     zoom: Type.Optional(Type.Object({ x: Type.Number(), y: Type.Number(), w: Type.Number(), h: Type.Number() }, { description: "Crop + scale a rectangular region on any image — direct formats (png,jpg,gif,webp,bmp), converted formats (heic,tiff,tif,avif,...) and PDF image mode. Normalized [x,y,w,h] fractions 0–1 of the bounding box; omit for full frame." })),
-    grid: Type.Optional(Type.Object({ rows: Type.Number(), cols: Type.Number(), region: Type.Optional(Type.Object({ x: Type.Number(), y: Type.Number(), w: Type.Number(), h: Type.Number() })) }, { description: "Tile a region into a regular grid of sharp per-cell crops, each with its exact zoom={...} hint. Works on direct formats, converted formats, and PDF image mode. Use to pinpoint a cell/subject in a large image whose full-page view is too downscaled to read." })),
-    locate: Type.Optional(Type.Object({ rows: Type.Number(), cols: Type.Number(), region: Type.Optional(Type.Object({ x: Type.Number(), y: Type.Number(), w: Type.Number(), h: Type.Number() })), overlap: Type.Optional(Type.Number()) }, { description: "Coarse-to-fine tiling with overlap: tiles a region into overlapping tiles, the model picks the tile containing the target, then drills in with zoom. Works on direct formats, converted formats, and PDF image mode. Defaults: 4×4, 15% overlap, full frame." })),
     info: Type.Optional(Type.Boolean({ description: "Metadata-only first look on ffmpeg-decodable media (image/audio/video): size, duration, dimensions, video codec, audio streams. No media loaded; use before deciding how to load a large file. No ad-hoc ffprobe script needed." })),
   }),
   executionMode: config.defaults.executionMode,
@@ -156,8 +154,6 @@ async function readExtended(params, ctx): Promise<AgentToolResult> {
     if (!input.includes("image")) return note("Model does not support images");
     const bytes = await fs.readFile(path);
     // zoom: crop region → processImageBytes(cropped)
-    // grid: computeGridCells → N × cropRegionToPng → N × processImageBytes
-    // locate: computeLocateTiles → N × cropRegionToPng → N × processImageBytes
     const { data, mimeType } = await processImage(bytes, MIME[ext]);
     return ok([txt(`Read image [${mimeType}]`), img(data, mimeType)]);
   }
@@ -165,7 +161,7 @@ async function readExtended(params, ctx): Promise<AgentToolResult> {
     if (!input.includes("image")) return note("Model does not support images");
     const tmp = await ffmpegConvert(path, "png");
     const bytes = await fs.readFile(tmp); rm(tmp);
-    // zoom/grid/locate: same crop routing as direct (on the converted raster)
+    // zoom: same crop routing as direct (on the converted raster)
     const { data, mimeType } = await processImage(bytes, "image/png");
     return ok([txt(`Read image [${mimeType}]`), img(data, mimeType)]);
   }
@@ -244,34 +240,6 @@ Mirrors native `read`'s flow: resolve → stat → detect → process → return
 - **Memory:** mupdf uses WASM memory (not GC'd). All objects (`doc`, `page`, `pixmap`, `stext`) must be `.destroy()`'d in `finally` blocks.
 - **Config:** `pdf.defaultDpi` (150), `pdf.maxPagesPerCall` (10).
 
-### Region-finding tools (`grid`, `locate`)
-
-Complement `zoom` (above). `zoom` crops a region you already know the coordinates for; these tools **find** the coordinates for a region you can see but not pinpoint in a downscaled overview.
-
-**Why — the per-image resize gate.** Every image is capped at 2000×2000 / 4.5MB before reaching the model (pi's resize core). A tall page (e.g. 8944px) is downscaled to ~2000px, so individual cells/subjects become too small to identify and coordinates must be guessed → guess→verify→tighten. **Tiling defeats the gate:** each tile is small enough to pass the gate un-downscaled, so per-tile thumbnails are sharp and coordinates are exact.
-
-**Shared design.** Both return, per region, a **sharp thumbnail + the region's exact normalized `{x,y,w,h}` bbox**. The model's only job is one visual judgment (which region is the target); the tool does the partitioning/cropping/coordinate math. **Division of labor:** tool = blind work (partition, crop, compute bboxes), model = one reliable visual pick on a sharp image, result = the bridge. **Self-guiding results:** each region's result carries a ready-to-use `zoom={...}` hint, so the next step is copy-paste, not memory.
-
-**Applies to every image path:** direct formats, converted formats, and PDF image mode. For PDF, the first rendered page is written to a temp PNG and tiled (same pattern as the image convert handler).
-
-**`grid` — regular partition (v1).** `grid(path, region, rows, cols)` divides a supplied region into a regular `rows × cols` array by arithmetic (`x = x0 + c·cell_w`, `y = y0 + r·cell_h`). For uniform layouts (dashboards). v2 (auto-detect grid bounds via luminance projection) is future work (§14).
-
-**`locate` — coarse-to-fine tiling with overlap (v1).** `locate(path, region, rows, cols, overlap)` partitions a region into `rows × cols` **overlapping** tiles. Each tile extends into its neighbor by `overlap` fraction of the base tile size (default 0.15, i.e. 15% overlap), so a target near a tile boundary is fully inside at least one tile. The model picks the tile containing the target; if the target is small within that tile, call `locate` again on that tile's region for a finer sub-tile; then `zoom` to the exact bbox. A **coarse-to-fine search**: bounded cost (~2 levels ≈ 16 tiles + 16 sub-tiles = 32 crops), generalizes to any content (person, object, point) with **no CV**. Finds a **bbox, not a mask** — sufficient for "make it bigger."
-
-- **Tile computation:** `computeLocateTiles(region, rows, cols, overlap)` — pure function. Tile (r,c) starts at `(region.x + c·baseW, region.y + r·baseH)` with dimensions `baseW·(1+overlap) × baseH·(1+overlap)`, clamped to the region boundary. Zero overlap equals a regular grid (verified by test).
-- **Crop pipeline:** `locateRegion` probes dimensions once, then crops each tile at full source resolution via `cropRegionToPngWithDims` — same pattern as `grid`.
-- **Rendering:** `renderLocate` emits interleaved text+image blocks: one sharp tile + bbox + zoom hint per tile, plus a trailing summary with sub-tile guidance.
-- **Defaults:** 4×4 tiles, 15% overlap, full frame. Cap: 49 tiles (7×7).
-
-**API.**
-```
-grid(path, region?: {x,y,w,h}, rows, cols) → [{ row, col, bbox: {x,y,w,h}, image }]
-locate(path, region?: {x,y,w,h}, rows?, cols?, overlap?) → [{ row, col, bbox: {x,y,w,h}, image }]
-```
-Both reuse `cropRegionToPng`; `region` defaults to the full frame.
-
-**Guidance.** Tool `description`/`promptGuidelines` name the trigger ("overview too downscaled to identify a specific region/subject") and the workflow shape (tile coarse → pick → sub-tile if needed → zoom). The heavy lifting is in the self-guiding results, not the description.
-
 ### Metadata probe (`info=true`)
 
 - **Zero deps:** `ffmpeg -hide_banner -i file` prints the stream dump to stderr; parse it for format, duration, bitrate, video codec/dimensions, audio codec/sample rate. No ffprobe binary needed.
@@ -338,8 +306,7 @@ pi-extendedread-plugin/
     config.ts           — loads config.json, exposes model capabilities + knobs
     ffmpeg.ts           — ffmpeg helpers: convert, crop, dimension probing
     image.ts            — processImageBytes (wraps pi's Photon pipeline)
-    region.ts           — grid + locate: tile math, crop pipeline, rendering
-    pdf.ts              — PDF: text extraction, page rendering, TOC, search, zoom/grid/locate
+    pdf.ts              — PDF: text extraction, page rendering, TOC, search, zoom
     pptx.ts             — PPTX → PDF via @s8fy/pptx-converter, delegates to pdf.ts
     types.d.ts          — ambient module declarations for pi's dist exports
     patch/
