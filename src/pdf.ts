@@ -2,7 +2,7 @@
  * pdf.ts — PDF handling via mupdf (WASM).
  *
  * Text extraction, page rendering to PNG, TOC/outline, search, and DPI
- * control. Supports zoom (region crop) in image mode.
+ * control. Supports trace/crop (region-finding v2) in image mode.
  */
 
 import { readFile, unlink, writeFile } from "node:fs/promises";
@@ -12,8 +12,8 @@ import { randomUUID } from "node:crypto";
 import type { PluginConfig } from "./config.js";
 import type { AgentToolResult } from "./readExtended.js";
 import { resolveGateOptions } from "./config.js";
-import { cropRegion, ZOOM_UNAVAILABLE_HINT } from "./ffmpeg.js";
 import { gateImageFile } from "./gate.js";
+import { traceOverlay, cropToTemp, cropReadout, TRACE_UNAVAILABLE_HINT } from "./trace.js";
 
 /**
  * Read a PDF: text extraction, image rendering, TOC, search.
@@ -21,9 +21,10 @@ import { gateImageFile } from "./gate.js";
  */
 export async function readPdf(
 	path: string,
-	params: { pages?: string; mode?: "text" | "image"; toc?: boolean; search?: string; dpi?: number; zoom?: { x: number; y: number; w: number; h: number } },
+	params: { pages?: string; mode?: "text" | "image"; toc?: boolean; search?: string; dpi?: number; trace?: { x?: number; y?: number; w?: number; h?: number; lines?: number } },
 	config: PluginConfig,
 	input: string[],
+	sessionId: string,
 ): Promise<{ content: AgentToolResult["content"]; isError?: boolean }> {
 	const mupdf = await import("mupdf") as any;
 	const buffer = await readFile(path);
@@ -79,7 +80,14 @@ export async function readPdf(
 				text: `PDF: ${totalPages} pages. Read pages ${pageIndices.map((i) => i + 1).join(",")}. Use pages='N-M' for more, mode='image' to view visually, toc=true for outline, search='query' to find text.`,
 			});
 		} else {
-			// Image rendering
+			// Image rendering. With trace: overlay numbered lines (no coords) or
+			// crop the rendered page at 0-100 coords (with coords).
+			const gateTemp = async (tempPath: string): Promise<AgentToolResult["content"]> => {
+				const image = await gateImageFile(tempPath, "image/png", "jpeg", gateOpts, config.defaults.ffmpegTimeoutMs);
+				if (image) return [{ type: "image", data: image.data, mimeType: image.mimeType }];
+				const buf = await readFile(tempPath);
+				return [{ type: "image", data: buf.toString("base64"), mimeType: "image/png" }];
+			};
 			for (const i of pageIndices) {
 				const page = doc.loadPage(i);
 				try {
@@ -95,23 +103,58 @@ export async function readPdf(
 						});
 						const tmpInput = join(tmpdir(), `pi-pdf-${process.pid}-${randomUUID()}.png`);
 						await writeFile(tmpInput, png);
-						let image = null;
-						if (params.zoom) {
-							const cropped = await cropRegion(tmpInput, params.zoom, "png", config.defaults.ffmpegTimeoutMs);
-							if (cropped) {
-								image = await gateImageFile(cropped, "image/png", "jpeg", gateOpts, config.defaults.ffmpegTimeoutMs);
-								await unlink(cropped).catch(() => {});
+						const isCrop =
+							params.trace !== undefined &&
+							params.trace.x !== undefined &&
+							params.trace.y !== undefined &&
+							params.trace.w !== undefined &&
+							params.trace.h !== undefined;
+						if (params.trace) {
+							if (isCrop) {
+								const crop = await cropToTemp(
+									tmpInput,
+									{ x: params.trace.x!, y: params.trace.y!, w: params.trace.w!, h: params.trace.h! },
+									sessionId,
+									config.defaults.ffmpegTimeoutMs,
+								);
+								if (crop) {
+									blocks.push({ type: "text", text: `Crop [pdf page ${i + 1}] region ${cropReadout(crop)} → ${crop.tempPath}` });
+									blocks.push(...(await gateTemp(crop.tempPath)));
+								} else {
+									blocks.push({ type: "text", text: TRACE_UNAVAILABLE_HINT });
+								}
 							} else {
-								blocks.push({ type: "text", text: ZOOM_UNAVAILABLE_HINT });
+								const result = await traceOverlay(tmpInput, sessionId, {
+									divisions: params.trace.lines,
+									timeoutMs: config.defaults.ffmpegTimeoutMs,
+									maxDim: gateOpts.maxDim,
+								});
+								if (result) {
+									blocks.push({
+										type: "text",
+										text:
+											`Trace [pdf page ${i + 1}] — numbered overlay, ${result.divisions} divisions (0-100).` +
+											(result.panes.length > 1
+												? ` Split into ${result.panes.length} halves; numbering continuous.`
+												: ""),
+										});
+									for (const pane of result.panes) {
+										blocks.push({
+											type: "text",
+											text: `pane x:${pane.xRange[0]}-${pane.xRange[1]} y:${pane.yRange[0]}-${pane.yRange[1]} → ${pane.tempPath}`,
+										});
+										blocks.push(...(await gateTemp(pane.tempPath)));
+									}
+									blocks.push({
+										type: "text",
+										text: "Read the numbers to pick coordinates, then crop with trace={x,y,w,h} (0-100) on the same page.",
+									});
+								} else {
+									blocks.push({ type: "text", text: TRACE_UNAVAILABLE_HINT });
+								}
 							}
-						}
-						if (!image) image = await gateImageFile(tmpInput, "image/png", "jpeg", gateOpts, config.defaults.ffmpegTimeoutMs);
-						await unlink(tmpInput).catch(() => {});
-						if (image) {
-							blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
 						} else {
-							// Gate unavailable — raw render, never lose the page.
-							blocks.push({ type: "image", data: png.toString("base64"), mimeType: "image/png" });
+							blocks.push(...(await gateTemp(tmpInput)));
 						}
 					} finally {
 						pixmap.destroy();

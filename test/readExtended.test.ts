@@ -14,6 +14,15 @@ import { execFile } from "node:child_process";
 
 import { readExtended } from "../src/readExtended.js";
 import { cropRegion, parseFfmpegDims, parseFfmpegProbe, renderProbeText } from "../src/ffmpeg.js";
+import {
+	snapDivisions,
+	autoDivisions,
+	splitPlan,
+	buildOverlayFilter,
+	cropReadout,
+	cropToTemp,
+	cleanSession,
+} from "../src/trace.js";
 import type { PluginConfig } from "../src/config.js";
 import type { AgentToolResult } from "../src/readExtended.js";
 
@@ -38,7 +47,7 @@ const config: PluginConfig = {
 test("file not found", async () => {
 	const result = await readExtended(
 		{ path: "/nonexistent/file.png" },
-		{ cwd: "/tmp", modelId: "test" },
+		{ cwd: "/tmp", modelId: "test", sessionId: "test" },
 		config,
 	);
 	assert.equal(result.isError, true);
@@ -48,7 +57,7 @@ test("file not found", async () => {
 test("not a file (directory)", async () => {
 	const result = await readExtended(
 		{ path: "/tmp" },
-		{ cwd: "/tmp", modelId: "test" },
+		{ cwd: "/tmp", modelId: "test", sessionId: "test" },
 		config,
 	);
 	assert.equal(result.isError, true);
@@ -62,7 +71,7 @@ test("unsupported extension", async () => {
 
 	const result = await readExtended(
 		{ path: file },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	assert.match(text(result.content), /unsupported format/);
@@ -78,7 +87,7 @@ test("size cap exceeded", async () => {
 
 	const result = await readExtended(
 		{ path: file },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	assert.match(text(result.content), /File too large/);
@@ -94,7 +103,7 @@ test("tilde expansion", async () => {
 	// Use ~ in the path (should expand to homedir).
 	const result = await readExtended(
 		{ path: `~/${file.split("/").pop()}` },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	// Should be "File not found" (since the file isn't actually in homedir).
@@ -122,7 +131,7 @@ test("capability gate: model doesn't support images", async () => {
 
 	const result = await readExtended(
 		{ path: file },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		noImageConfig,
 	);
 	assert.match(text(result.content), /does not support images/);
@@ -161,7 +170,7 @@ test("image direct: small PNG passes the gate and returns an image block", async
 	const dir = await mkdtemp(join(tmpdir(), "extread-"));
 	const file = await makePng(100, 80, "green", dir);
 
-	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.equal(result.isError, undefined);
 	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
 	assert.equal(images.length, 1);
@@ -174,7 +183,7 @@ test("gate: over-limit direct PNG is downscaled to maxDim (re-encoded as PNG)", 
 	const dir = await mkdtemp(join(tmpdir(), "extread-"));
 	const file = await makePng(3000, 2000, "green", dir);
 
-	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.equal(result.isError, undefined);
 	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
 	assert.equal(images.length, 1);
@@ -206,7 +215,7 @@ test("gate: over-limit multi-frame GIF re-encodes to a single PNG (first frame)"
 	const dir = await mkdtemp(join(tmpdir(), "extread-"));
 	const file = await makeMultiFrameGif(dir);
 
-	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.equal(result.isError, undefined);
 	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
 	assert.equal(images.length, 1);
@@ -230,7 +239,7 @@ test("audio: WAV returns a probe-only note (no media block)", async () => {
 
 	const result = await readExtended(
 		{ path: file },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const allText = text(result.content);
@@ -262,7 +271,7 @@ test("video: 2s mp4 auto-frames to two image blocks (auto minimum)", async () =>
 	const file = join(dir, "test.mp4");
 	await genMp4(file, 2);
 
-	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.equal(result.isError, undefined);
 	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
 	assert.equal(images.length, 2);
@@ -278,7 +287,7 @@ test("video: frames=3 extracts three frames", async () => {
 	const file = join(dir, "test.mp4");
 	await genMp4(file, 4);
 
-	const result = await readExtended({ path: file, frames: 3 }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file, frames: 3 }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.equal(result.isError, undefined);
 	const images = (result.content as { type: string }[]).filter((b) => b.type === "image");
 	assert.equal(images.length, 3);
@@ -292,7 +301,7 @@ test("video: frames=0 returns a validation note", async () => {
 	const file = join(dir, "test.mp4");
 	await genMp4(file, 2);
 
-	const result = await readExtended({ path: file, frames: 0 }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file, frames: 0 }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.match(text(result.content), /frames must be between 1 and 16/);
 
 	await rm(dir, { recursive: true });
@@ -303,7 +312,7 @@ test("video: frames=17 returns a validation note", async () => {
 	const file = join(dir, "test.mp4");
 	await genMp4(file, 2);
 
-	const result = await readExtended({ path: file, frames: 17 }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file, frames: 17 }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.match(text(result.content), /frames must be between 1 and 16/);
 
 	await rm(dir, { recursive: true });
@@ -315,7 +324,7 @@ test("video: extraction failure returns a note (no crash)", async () => {
 	const file = join(dir, "test.mp4");
 	await writeFile(file, Buffer.from([0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70]));
 
-	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.match(text(result.content), /frame extraction failed/);
 
 	await rm(dir, { recursive: true });
@@ -336,7 +345,7 @@ test("video: capability gate (no image support)", async () => {
 		},
 	};
 
-	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, noImageConfig);
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test", sessionId: "test" }, noImageConfig);
 	assert.match(text(result.content), /does not support images/);
 
 	await rm(dir, { recursive: true });
@@ -362,7 +371,7 @@ test("PDF text extraction", async () => {
 
 	const result = await readExtended(
 		{ path: file },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const allText = text(result.content);
@@ -380,7 +389,7 @@ test("PDF page selector", async () => {
 	// Request page 5 (out of range for a 1-page PDF).
 	const result = await readExtended(
 		{ path: file, pages: "5" },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	// Should not crash; out-of-range pages are silently skipped.
@@ -397,7 +406,7 @@ test("PDF image mode: rendered pages go through the gate (JPEG)", async () => {
 
 	const result = await readExtended(
 		{ path: file, mode: "image" },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((c) => c.type === "image");
@@ -425,7 +434,7 @@ test("PDF: image mode gated by model capability", async () => {
 
 	const result = await readExtended(
 		{ path: file, mode: "image" },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		noImageConfig,
 	);
 	const allText = text(result.content);
@@ -441,7 +450,7 @@ test("PDF: toc=true returns outline", async () => {
 
 	const result = await readExtended(
 		{ path: file, toc: true },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const allText = text(result.content);
@@ -457,7 +466,7 @@ test("PDF: search returns no matches for absent text", async () => {
 
 	const result = await readExtended(
 		{ path: file, search: "nonexistent text that is not in the pdf" },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const allText = text(result.content);
@@ -473,7 +482,7 @@ test("PDF: dpi parameter is accepted (image mode)", async () => {
 
 	const result = await readExtended(
 		{ path: file, mode: "image", dpi: 300 },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const allText = text(result.content);
@@ -491,7 +500,7 @@ test("PPTX: returns conversion failed for invalid file", async () => {
 
 	const result = await readExtended(
 		{ path: file },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const allText = text(result.content);
@@ -569,13 +578,13 @@ test("cropRegion returns null (no throw) when dimensions cannot be resolved", as
 	assert.equal(out, null);
 });
 
-test("direct image with zoom: crop then gate returns an image block", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "zoom-img-"));
+test("direct image with trace crop: crop then gate returns an image block", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "trace-img-"));
 	const file = await makePng(200, 150, "green", dir);
 
 	const result = await readExtended(
-		{ path: file, zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } },
-		{ cwd: dir, modelId: "test" },
+		{ path: file, trace: { x: 0, y: 0, w: 50, h: 50 } },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	assert.equal(result.isError, undefined);
@@ -585,14 +594,14 @@ test("direct image with zoom: crop then gate returns an image block", async () =
 	await rm(dir, { recursive: true });
 });
 
-test("PDF image mode with zoom: crop then gate returns an image block", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "zoom-pdf-"));
+test("PDF image mode with trace crop: crop then gate returns an image block", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "trace-pdf-"));
 	const file = join(dir, "test.pdf");
 	await writeFile(file, PDF_BYTES);
 
 	const result = await readExtended(
-		{ path: file, mode: "image", zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } },
-		{ cwd: dir, modelId: "test" },
+		{ path: file, mode: "image", trace: { x: 0, y: 0, w: 50, h: 50 } },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	assert.equal(result.isError, undefined);
@@ -607,7 +616,7 @@ test("PDF image mode without zoom: full page image block", async () => {
 	const file = join(dir, "test.pdf");
 	await writeFile(file, PDF_BYTES);
 
-	const result = await readExtended({ path: file, mode: "image" }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file, mode: "image" }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.ok(result.isError !== true);
 	const blocks = result.content as { type: string }[];
 	assert.ok(blocks.some((b) => b.type === "image"));
@@ -616,8 +625,8 @@ test("PDF image mode without zoom: full page image block", async () => {
 	await rm(dir, { recursive: true });
 });
 
-test("converted image (tiff) with zoom: convert, crop, gate", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "zoom-conv-"));
+test("converted image (tiff) with trace crop: convert, crop, gate", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "trace-conv-"));
 	const bin = (await import("@ffmpeg-installer/ffmpeg")).path;
 	const file = join(dir, "gen.tif");
 	await new Promise<void>((res, rej) => {
@@ -625,8 +634,8 @@ test("converted image (tiff) with zoom: convert, crop, gate", async () => {
 	});
 
 	const result = await readExtended(
-		{ path: file, zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } },
-		{ cwd: dir, modelId: "test" },
+		{ path: file, trace: { x: 0, y: 0, w: 50, h: 50 } },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	assert.equal(result.isError, undefined);
@@ -636,22 +645,125 @@ test("converted image (tiff) with zoom: convert, crop, gate", async () => {
 	await rm(dir, { recursive: true });
 });
 
-test("PDF image mode with an overflowing zoom emits the fallback hint and returns the full page", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "zoom-pdf-fallback-"));
+test("PDF image mode with an overflowing trace crop clamps to the page", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "trace-pdf-overflow-"));
 	const file = join(dir, "test.pdf");
 	await writeFile(file, PDF_BYTES);
 
-	// w=2,h=2 overflows the raster; the crop falls back to the full page.
-	const result = await readExtended({ path: file, mode: "image", zoom: { x: 0, y: 0, w: 2, h: 2 } }, { cwd: dir, modelId: "test" }, config);
+	// w=200,h=200 (0-100) overflows the page; the crop clamps to the full raster.
+	const result = await readExtended({ path: file, mode: "image", trace: { x: 0, y: 0, w: 200, h: 200 } }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.equal(result.isError, undefined);
 	const blocks = result.content as { type: string; text?: string }[];
-	const hintIdx = blocks.findIndex((b) => b.type === "text" && /unavailable/i.test(b.text ?? ""));
+	const cropIdx = blocks.findIndex((b) => b.type === "text" && /Crop \[pdf/i.test(b.text ?? ""));
 	const imgIdx = blocks.findIndex((b) => b.type === "image");
-	assert.notEqual(hintIdx, -1, "expected the model-visible zoom-unavailable fallback hint");
-	assert.notEqual(imgIdx, -1, "expected a full-page image block");
-	assert.ok(hintIdx < imgIdx, "fallback hint should appear before the image block it qualifies");
+	assert.notEqual(cropIdx, -1, "expected a crop readout");
+	assert.notEqual(imgIdx, -1, "expected an image block");
+	assert.ok(cropIdx < imgIdx, "crop readout should appear before the image block");
 
 	await rm(dir, { recursive: true });
+});
+
+test("trace overlay (no coords) returns numbered overlay + pane info", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "trace-overlay-"));
+	const file = await makePng(200, 150, "green", dir);
+
+	const result = await readExtended(
+		{ path: file, trace: {} },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
+		config,
+	);
+	assert.equal(result.isError, undefined);
+	const blocks = result.content as { type: string; text?: string }[];
+	const traceIdx = blocks.findIndex((b) => b.type === "text" && /Trace \[image\/png\]/i.test(b.text ?? ""));
+	const imgIdx = blocks.findIndex((b) => b.type === "image");
+	assert.notEqual(traceIdx, -1, "expected a trace readout");
+	assert.notEqual(imgIdx, -1, "expected an image block");
+	assert.ok(traceIdx < imgIdx, "trace readout should appear before the image block");
+
+	await rm(dir, { recursive: true });
+});
+
+// --- trace.ts geometry ---
+
+test("snapDivisions snaps to a divisor of 100", () => {
+	assert.equal(snapDivisions(4), 4);
+	assert.equal(snapDivisions(5), 5);
+	assert.equal(snapDivisions(10), 10);
+	assert.equal(snapDivisions(3), 4); // nearest of {4,5,10,20,25}
+	assert.equal(snapDivisions(7), 5); // 5 (diff 2) beats 10 (diff 3)
+	assert.equal(snapDivisions(0), 4);
+});
+
+test("autoDivisions scales with the longest side", () => {
+	// 200px -> 1 division -> snaps to 4 (min legible grid)
+	assert.equal(autoDivisions(200), 4);
+	// 2000px -> 10 divisions
+	assert.equal(autoDivisions(2000), 10);
+});
+
+test("splitPlan picks the split by the over-limit side", () => {
+	assert.equal(splitPlan({ width: 3000, height: 1000 }, 2000), "left-right");
+	assert.equal(splitPlan({ width: 1000, height: 3000 }, 2000), "top-bottom");
+	assert.equal(splitPlan({ width: 1000, height: 1000 }, 2000), "none");
+	// square over-limit: width wins the tie (>=)
+	assert.equal(splitPlan({ width: 3000, height: 3000 }, 2000), "left-right");
+});
+
+test("buildOverlayFilter emits drawbox lines and (with a font) drawtext labels", () => {
+	const noFont = buildOverlayFilter(100, 100, 10, null, 14);
+	assert.ok(noFont.includes("drawbox="));
+	assert.ok(!noFont.includes("drawtext="));
+	const withFont = buildOverlayFilter(100, 100, 10, "/tmp/Font.ttf", 14);
+	assert.ok(withFont.includes("drawtext="));
+	assert.ok(withFont.includes("text='0'"));
+	assert.ok(withFont.includes("text='100'"));
+});
+
+test("cropToTemp crops at 0-100 coords and reports the clamped region", async () => {
+	const src = await makePng(500, 300, "green");
+	try {
+		const out = await cropToTemp(src, { x: 0, y: 0, w: 50, h: 50 }, "test", 30_000);
+		assert.ok(out, "expected a crop result");
+		assert.deepEqual(out!.region, { x: 0, y: 0, w: 50, h: 50 });
+		assert.equal(out!.width, 250);
+		assert.equal(out!.height, 150);
+		// overflowing crop clamps to the full raster
+		const big = await cropToTemp(src, { x: 0, y: 0, w: 200, h: 200 }, "test", 30_000);
+		assert.ok(big, "expected a clamped crop");
+		assert.equal(big!.width, 500);
+		assert.equal(big!.height, 300);
+	} finally {
+		await rm(src.split("/").slice(0, -1).join("/"), { recursive: true });
+	}
+});
+
+test("cropReadout formats 0-100 coords and pixel dims", () => {
+	const s = cropReadout({
+		tempPath: "/tmp/x.png",
+		region: { x: 10, y: 20, w: 30, h: 40 },
+		width: 100,
+		height: 120,
+		sourceWidth: 500,
+		sourceHeight: 300,
+	});
+	assert.match(s, /x=10\.0/);
+	assert.match(s, /y=20\.0/);
+	assert.match(s, /500x300/);
+});
+
+test("cleanSession removes the session temp dir and counts media files", async () => {
+	const src = await makePng(200, 150, "green");
+	const sessionId = "test-clean";
+	try {
+		const out = await cropToTemp(src, { x: 0, y: 0, w: 50, h: 50 }, sessionId, 30_000);
+		assert.ok(out, "expected a crop result");
+		const result = await cleanSession(sessionId);
+		assert.equal(result, 1, "expected 1 media file cleaned");
+		const again = await cleanSession(sessionId);
+		assert.equal(again, "no-session");
+	} finally {
+		await rm(src.split("/").slice(0, -1).join("/"), { recursive: true });
+	}
 });
 
 // --- Probe (info=true) ---
@@ -701,7 +813,7 @@ test("info=true probes a real mp4 without loading media", async () => {
 
 	const result = await readExtended(
 		{ path: file, info: true },
-		{ cwd: dir, modelId: "test" },
+		{ cwd: dir, modelId: "test", sessionId: "test" },
 		config,
 	);
 	const t = text(result.content);
@@ -730,10 +842,10 @@ test("info=true bypasses capability gate", async () => {
 		},
 	};
 
-	const full = await readExtended({ path: file }, { cwd: dir, modelId: "text-model" }, tight);
+	const full = await readExtended({ path: file }, { cwd: dir, modelId: "text-model", sessionId: "test" }, tight);
 	assert.match(text(full.content), /does not support images/);
 
-	const probe = await readExtended({ path: file, info: true }, { cwd: dir, modelId: "text-model" }, tight);
+	const probe = await readExtended({ path: file, info: true }, { cwd: dir, modelId: "text-model", sessionId: "test" }, tight);
 	const t = text(probe.content);
 	assert.match(t, /\(64x48\)/);
 	assert.ok(!/does not support/.test(t));
@@ -746,7 +858,7 @@ test("info=true on PDF points to toc/pages", async () => {
 	const file = join(dir, "doc.pdf");
 	await writeFile(file, "%PDF-1.4\n");
 
-	const result = await readExtended({ path: file, info: true }, { cwd: dir, modelId: "test" }, config);
+	const result = await readExtended({ path: file, info: true }, { cwd: dir, modelId: "test", sessionId: "test" }, config);
 	assert.match(text(result.content), /toc=true\/pages/);
 
 	await rm(dir, { recursive: true });

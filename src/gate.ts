@@ -7,7 +7,7 @@
  *    within limits; over-limit direct images are re-encoded in their own
  *    format (never cross-converted).
  *  - **Derived** rasters (converted formats, video frames, PDF renders,
- *    zoom crops) are encoded to JPEG.
+ *    trace crops) are encoded to JPEG.
  *
  * Gate = autorotate → downscale to `maxDim` → encode with a quality ladder
  * until within the base64 budget.

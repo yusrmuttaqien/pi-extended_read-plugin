@@ -10,6 +10,7 @@ Complements pi's native `read` tool (text) by adding:
 - **PDF** (text extraction + visual page rendering, with pagination)
 - **PPTX** (converts to PDF via @s8fy/pptx-converter, then uses the PDF pipeline)
 - **Audio** (wav, mp3, flac, ogg, aiff, aif, m4a, aac, wma, opus) — probe-only: `info=true` metadata, no media load
+- **Region-finding (trace)** — for static images + PDF image mode: `trace={}` overlays numbered guiding lines (0-100 coords) to read coordinates; `trace={x,y,w,h}` (0-100) crops the untraced original at those coords
 
 ## How it works
 
@@ -31,7 +32,7 @@ No patches to pi are required — the tool emits only `image` blocks, which pi s
 Every raster this tool emits passes through the gate (`src/gate.ts`):
 
 - **Direct formats** (png, jpg, jpeg, gif, webp, bmp) pass through **byte-identical** when within limits. Over-limit direct images are re-encoded **in their own format** (never cross-converted).
-- **Derived rasters** (converted formats, video frames, PDF renders, zoom crops) are encoded to **JPEG**.
+- **Derived rasters** (converted formats, video frames, PDF renders, trace crops) are encoded to **JPEG**.
 - The gate enforces `imageGate.maxDim` (default 2000px) and `imageGate.maxBytes` (default 4.5MB base64) via a quality ladder. Animated GIFs flatten to the first frame (noted).
 - If the gate cannot process a file (no ffmpeg / probe failure), raw bytes are returned with a note.
 
@@ -39,10 +40,11 @@ Every raster this tool emits passes through the gate (`src/gate.ts`):
 |---|---|
 | `extendedRead path="photo.png"` | Image block (pass-through or re-encoded PNG, gated) |
 | `extendedRead path="photo.heic"` | Converted to JPEG via the gate |
-| `extendedRead path="photo.png" zoom='{x:0,y:0,w:0.5,h:0.5}'` | Magnify upper-left quadrant |
+| `extendedRead path="photo.png" trace={x:0,y:0,w:50,h:50}` | Crop upper-left quadrant (0-100 coords) |
+| `extendedRead path="photo.png" trace={}` | Numbered guiding-line overlay (0-100 coords) to read coordinates |
 | `extendedRead path="photo.png" info=true` | Metadata text (size, format, dimensions) — no image loaded |
 
-**`zoom`** — crop + scale a rectangular region. Normalized `[x, y, w, h]` fractions 0–1 of the image. Works on any image format, direct, converted, and PDF image mode.
+**`trace`** — region-finding (replaces `zoom`). `trace={}` overlays numbered guiding lines (0-100 percent) so the model can read coordinates; `trace={x,y,w,h}` (0-100) crops the untraced original at those coords. Works on any image format, direct, converted, and PDF image mode. Trace/crop temp files live in `extendedread-tmp/<session_id>/`; run `/extended-read-clean` to clear this session's temp files.
 
 ## Video reading
 
@@ -70,7 +72,7 @@ Text extraction, visual rendering, table of contents, and text search via mupdf 
 | `extendedRead path="doc.pdf" mode="image"` | JPEG of page 1 (gated) |
 | `extendedRead path="doc.pdf" mode="image" pages="3,7"` | JPEG of pages 3 and 7 |
 | `extendedRead path="doc.pdf" mode="image" dpi=300` | Render at 300 DPI (gated) |
-| `extendedRead path="doc.pdf" mode="image" zoom='{x:0,y:0,w:0.5,h:0.5}'` | Magnify upper-left quadrant |
+| `extendedRead path="doc.pdf" mode="image" trace={x:0,y:0,w:50,h:50}` | Crop upper-left quadrant (0-100 coords) |
 | `extendedRead path="doc.pdf" toc=true` | Table of contents/outline |
 | `extendedRead path="doc.pdf" search="quarterly revenue"` | Pages matching query |
 

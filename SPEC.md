@@ -11,6 +11,7 @@ Provide the model with a dedicated tool for media files. The native `read` tool 
 - **PDF** (text extraction + visual page rendering, with pagination).
 - **PPTX** (converts to PDF via @s8fy/pptx-converter, then uses the PDF pipeline).
 - **Audio** (wav, mp3, flac, ogg, aiff, aif, m4a, aac, wma, opus) — probe-only metadata via `info=true`.
+- **Region-finding (trace)** — for static images + PDF image mode: `trace={}` overlays numbered guiding lines (0-100 coords) so the model can read coordinates; `trace={x,y,w,h}` (0-100) crops the untraced original at those coords.
 
 Media enters the context **lazily** — only when the model calls the tool.
 
@@ -74,15 +75,16 @@ defineTool({
     "Read a media file and return it as an attachment the model can perceive. " +
     "Images: png, jpg, jpeg, gif, webp, bmp, heic, heif, tiff, tif, tga, avif — every image is gated (bounded dims/bytes; derived rasters are JPEG). " +
     "Video: mp4, webm, mkv, mov, avi — read as evenly spaced JPEG frames (audio not included). " +
-    "PDF: text extraction (default) or page rendering to image. Use pages='1-5' for pagination, toc=true for outline, search='query' to find text, dpi=N for resolution, zoom='{x,y,w,h}' to crop+scale a rectangular region on any image — direct or converted formats and PDF image mode. " +
+    "PDF: text extraction (default) or page rendering to image. Use pages='1-5' for pagination, toc=true for outline, search='query' to find text, dpi=N for resolution. " +
+    "Region-finding (images + PDF image mode): trace={} overlays numbered guiding lines (0-100 coords) to read coordinates; trace={x,y,w,h} (0-100) crops the original at those coords. " +
     "Probe mode: info=true returns metadata only (size, duration, dimensions, audio streams) for image/audio/video without loading media — a first look on large video/audio; no ad-hoc ffprobe script needed. " +
     "PPTX: converts to PDF via @s8fy/pptx-converter, then uses the PDF pipeline. " +
     "For text files, use the native read tool.",
   promptSnippet: "Read media files",
   promptGuidelines: [
     "Use extendedRead to read media files (images, video, PDF) the user references.",
-    "Do not write ad-hoc scripts for actions the tool already provides: probe with info=true instead of parsing ffprobe/ffmpeg output, zoom for image regions, pages/toc/search for PDF navigation.",
-    "For large images, drill down with zoom before answering from a downscaled full-frame view.",
+    "Do not write ad-hoc scripts for actions the tool already provides: probe with info=true instead of parsing ffprobe/ffmpeg output, trace for image regions, pages/toc/search for PDF navigation.",
+    "For large images, read coordinates with trace={} then crop with trace={x,y,w,h} before answering from a downscaled full-frame view.",
     "Never read a long PDF all at once: toc=true when structure is unknown, search='query' to locate mentions, pages='5-10' for targeted pages, mode='image' (+dpi) for charts and scans.",
     "Video is read as frames (audio not included); probe large video/audio with info=true first. Files over maxBytes return a size note — do not retry blindly.",
     "Use the native read tool for text files.",
@@ -95,7 +97,7 @@ defineTool({
     search: Type.Optional(Type.String({ description: "PDF: search for text (case-insensitive), returns matching pages with context" })),
     dpi: Type.Optional(Type.Number({ description: "PDF: DPI for image mode (72-600, default from config)" })),
     info: Type.Optional(Type.Boolean({ description: "Metadata-only first look on ffmpeg-decodable media (image/audio/video): size, duration, dimensions, video codec, audio streams. No media loaded; use before deciding how to load a large file. No ad-hoc ffprobe script needed." })),
-    zoom: Type.Optional(Type.Object({ x: Type.Number(), y: Type.Number(), w: Type.Number(), h: Type.Number() }, { description: "Crop + scale a rectangular region on any image — direct formats (png,jpg,gif,webp,bmp), converted formats (heic,tiff,tif,avif,...) and PDF image mode. Normalized [x,y,w,h] fractions 0–1 of the bounding box; omit for full frame." })),
+    trace: Type.Optional(Type.Object({ x: Type.Optional(Type.Number()), y: Type.Optional(Type.Number()), w: Type.Optional(Type.Number()), h: Type.Optional(Type.Number()), lines: Type.Optional(Type.Number()) }, { description: "Region-finding (images + PDF image mode). No coords → trace mode: numbered overlay (0-100 coords) to read coordinates. With x,y,w,h (0-100) → crop mode: crop the original at those coords. lines=N overrides grid density (default 10)." })),
     frames: Type.Optional(Type.Number({ description: "Number of frames to extract from a video (1-16); omit for auto (~1 per 5s of duration)" })),
   }),
   executionMode: config.defaults.executionMode,
@@ -143,25 +145,31 @@ async function readExtended(params, ctx): Promise<AgentToolResult> {
     return ok([txt(result.legend), ...result.frames.flatMap(f => [txt(f.caption), img(f.data, "image/jpeg")])]);
   }
 
-  // 6. Size cap (images only).
-  if (modality === "image" && stat.size > maxBytes.image)
+  // 6. Size cap (images only, no trace — trace/crop bypass; the gate bounds output).
+  if (modality === "image" && !params.trace && stat.size > maxBytes.image)
     return note(`File too large (${stat.size} > ${maxBytes.image} bytes for image)`);
 
   // 7. Capability gate (images).
   if (!input.includes("image")) return note("Model does not support images");
 
   // 8. Image direct: native format — pass through within limits,
-  //    re-encode in own format over limits (gate).
-  if (IMAGE_DIRECT[ext]) return processImageContent(path, MIME[ext], "same", params.zoom);
+  //    re-encode in own format over limits (gate). Trace/crop routes to processTrace.
+  if (IMAGE_DIRECT[ext])
+    return params.trace
+      ? processTrace(path, MIME[ext], params.trace)
+      : processImageContent(path, MIME[ext], "same");
 
   // 9. Image converted: non-native format — gate to JPEG.
-  if (IMAGE_CONVERT[ext]) return processImageContent(path, MIME[ext], "jpeg", params.zoom);
+  if (IMAGE_CONVERT[ext])
+    return params.trace
+      ? processTrace(path, MIME[ext], params.trace)
+      : processImageContent(path, MIME[ext], "jpeg");
 
   // 10. PDF
-  if (ext === "pdf") return readPdf(path, params, config, input);
+  if (ext === "pdf") return readPdf(path, params, config, input, ctx.sessionId);
 
   // 11. PPTX (convert to PDF via @s8fy/pptx-converter)
-  if (ext === "pptx") return readPptx(path, params, config, input);
+  if (ext === "pptx") return readPptx(path, params, config, input, ctx.sessionId);
 
   // 12. Unsupported
   return note(`[extendedRead: unsupported format ${ext}]`);
@@ -186,7 +194,7 @@ Mirrors native `read`'s flow: resolve → stat → detect → process → return
 Every raster this tool emits passes through the gate before serialization:
 
 - **Direct formats** pass through **byte-identical** when within limits (dims ≤ `maxDim`, base64 ≤ `maxBytes`). Over-limit direct images are re-encoded **in their own format** (never cross-converted).
-- **Derived rasters** (converted formats, video frames, PDF renders, zoom crops) are encoded to **JPEG**.
+- **Derived rasters** (converted formats, video frames, PDF renders, trace crops) are encoded to **JPEG**.
 - Pipeline: `autorotate` (EXIF orientation, when the bundled ffmpeg has the filter — probed once) → `scale=maxDim:maxDim:force_original_aspect_ratio=decrease` → encode. JPEG targets flatten alpha onto white.
 - **Quality ladder:** if the encode exceeds `maxBytes`, retry at quality −5/−10/−15 (lossless formats: single encode).
 - **GIF:** animated GIFs flatten to the first frame (noted).
@@ -223,14 +231,24 @@ Audio media is no longer loaded. A note points to `info=true` for metadata (form
 - **TOC:** `toc=true` → `doc.loadOutline()` returns hierarchical outline with titles and page refs. Formatted as indented list.
 - **Search:** `search='query'` → `page.search(needle)` per page. Returns matching pages with 60-char context windows. Case-insensitive.
 - **DPI:** `dpi=N` overrides `config.defaults.pdf.defaultDpi` for image mode. Range 72–600.
-- **Region zoom (`zoom`):** crop + scale a rectangular region on any image (text has no pixels to enlarge). Param `{x,y,w,h}` are normalized fractions in [0,1] of the page/image bounding box — resolution-independent so the model needs no pixel/DPI math. Applies to every image path: direct formats, converted formats, and PDF image mode:
-  - **Direct image:** crop the source file at `frac × originalPixelDims` (own format), then gate.
-  - **Converted image:** crop the source at `frac × rasterDims` (JPEG), then gate.
-  - **PDF image mode:** mupdf renders the page to PNG; the render (and any zoom crop) goes through the gate so every image this tool returns is bounded (raw-bytes fallback on gate failure).
-  - **Reference frame:** fractions are relative to the full raster already shown in image mode; no new coordinate metadata is needed. Ordering: for a PDF the model must render the full page (`mode="image"`) first to obtain a frame it can crop from, then request fractional boxes — inherent and not extra work.
-  - **Default:** omit `zoom` → full frame. Crop is done with ffmpeg's `crop=w:h:x:y`; overflowing boxes clamp to the raster (with a fallback hint). Targeting is approximate (eyeballed fractions), which is acceptable for "get that region bigger" and not pixel-perfect.
+- **Region-finding:** see the **Trace** subsection below — `trace={}` overlays numbered guiding lines (0-100 coords); `trace={x,y,w,h}` crops the untraced original.
 - **Memory:** mupdf uses WASM memory (not GC'd). All objects (`doc`, `page`, `pixmap`, `stext`) must be `.destroy()`'d in `finally` blocks.
 - **Config:** `pdf.defaultDpi` (150), `pdf.maxPagesPerCall` (10).
+
+### Trace (region-finding v2, `src/trace.ts`)
+
+Replaces `zoom`. A tracing mode for zooming: when the model wants to crop a region it can see but not pinpoint, the tool overlays numbered guiding lines so the model can read coordinates directly instead of guessing (avoids repeat zoom calls just to get it right).
+
+- **Scope:** static images only — direct formats, converted formats, PDF image mode, and GIF (as static/first frame). Video frames deferred (time dimension).
+- **Two modes:** (1) *trace* (`trace={}`, no coords) — overlay numbered guiding lines, return the numbered image + temp path; (2) *crop* (`trace={x,y,w,h}`) — crop the untraced original at those coords, return the cropped image + temp path.
+- **Crop from the untraced original:** the crop always operates on the original untraced image (full resolution, no guiding lines), never the traced overlay or a converted/compressed version.
+- **Coordinate space:** local per `path`, fresh each call, **0-100 percent** (two-digit integers, no decimals). Iterative drill-down (crop → re-trace) recovers finer precision.
+- **Line density:** auto from the longest side (~1 line per 200px), snapped to a divisor of 100 so labels land on whole numbers; overridable by `trace.lines`.
+- **Split for legibility:** if the longest side exceeds `maxDim`, the traced image is cut into two halves (left-right or top-bottom) with continuous numbering, so numbers stay crisp after the gate.
+- **Gate only at serialization:** the ffmpeg gate is applied only before the image is serialized; temp files on disk stay full-resolution.
+- **Region readout:** the crop echoes back the exact region (0-100 coords + pixel dims + source dims) so "did I get the right region?" is a pure yes/no.
+- **Temp lifecycle:** per-session temp dir `extendedread-tmp/<session_id>/media-<n>.png`; the model can pass a temp path back as `path` to re-trace/crop. `/extended-read-clean` deletes the session's temp dir.
+- **Fonts:** drawtext labels use the bundled SFNSMono.ttf (macOS); when no font is found, lines are still drawn (labels omitted, noted).
 
 ### Metadata probe (`info=true`)
 
@@ -264,8 +282,9 @@ pi-extendedread-plugin/
     ffmpeg.ts           — ffmpeg helpers: runFfmpeg, probe, crop, dimension probing
     gate.ts             — the ffmpeg image gate (pass-through / re-encode / JPEG)
     video.ts            — video → evenly spaced JPEG frames
-    pdf.ts              — PDF: text extraction, page rendering, TOC, search, zoom
+    pdf.ts              — PDF: text extraction, page rendering, TOC, search, trace crop
     pptx.ts             — PPTX → PDF via @s8fy/pptx-converter, delegates to pdf.ts
+    trace.ts            — region-finding v2: numbered overlay + crop (0-100 coords), per-session temp
     types.d.ts          — ambient module declarations for pi's dist exports
   config.json           — user-editable (self-documenting, §3)
   test/
@@ -331,21 +350,6 @@ Ordered by dependency: foundational work first, then what builds on it, then ind
 
 **Foundational**
 
-- **Trace (region-finding v2, replaces `zoom`)** — a tracing mode for zooming: when the model wants to crop a region it can see but not pinpoint, the tool overlays numbered guiding lines on the image so the model can read coordinates directly instead of guessing (avoids repeat zoom calls just to get it right). `grid` + `locate` are purged (PR #2); `zoom` remains until trace subsumes it. Design:
-  - **Scope (v1):** static images only — direct formats, converted formats, PDF image mode, and GIF (as static/first frame; animation dropped). Video frames deferred (time dimension).
-  - **Two modes:** (1) *trace* (no coords) — overlay numbered guiding lines, return the numbered image + temp path; (2) *crop* (with coords) — crop at those coords, return the cropped image + new temp path. Trace subsumes `zoom` (crop), `grid`, and `locate` (finding).
-  - **Crop from the untraced original:** the crop always operates on the original untraced image (full resolution, no guiding lines/numbers), never the traced overlay version or a converted/compressed version.
-  - **Coordinate space:** local per `path`, fresh each call, **0-100 percent** range. If a too-long/wide image is split into halves to keep numbers legible, the numbering is shared/continuous across the split halves.
-  - **Coordinate range:** 0-100 (percent) — two-digit integers, no decimals on the lines, most readable for the vision model. 1% resolution is adequate; iterative drill-down (crop → re-trace) recovers finer precision.
-  - **Line density:** auto based on image dimensions, overridable by a `lines` param.
-  - **Split for legibility:** if the image is too long/wide, split into two evenly-cut halves with continuous numbering, so the numbers stay crisp after the image gate (the gate degrades quality worst at large dimensions).
-  - **Gate only at serialization:** the ffmpeg gate is applied only before the image is serialized to the LLM; temp files on disk stay full-resolution.
-  - **Result:** cropped image block + the temp file path (ffmpeg always produces a temp file).
-  - **Temp reuse:** the model can reuse a temp file for further zooms — pass it as `path` to lay guiding lines again, repeating the cycle until satisfied.
-  - **Coordinate param:** accepts continuous values between the guiding lines (the lines only accelerate finding the closest number to the target).
-  - **Region readout:** echo back the exact region produced (normalized + pixel dims) so "did I get the right region?" is a pure yes/no.
-  - **Temp lifecycle:** per-session temp dir `extendedread-tmp/<session_id>/media-<n>.<ext>` (session id in the folder); a `/extended-read-clean` slash command deletes session folders whose session no longer exists.
-  - **Open risk:** number legibility is the make-or-break — vision models read "pick the box" (grid/locate) more reliably than "read a number off a line"; the split-into-halves is the mitigation, but legibility must be validated on real downscaled images before fully retiring the pick-based approach.
 - **Local omni model (opt-in power mode)** — host a small CPU omni model to give the plugin semantic understanding the main model's vision can't: `LiquidAI/LFM3-Omni-2B-GGUF` (2B, understands text/image/video/audio, answers in text+speech; llama.cpp v0.8.0+, Q4_K_M ~1.3 GB + projectors, non-reasoning). **Hosting:** don't bundle — shell out to a `llama-cli`/`llama-mtmd-cli` binary (external prerequisite, like ffmpeg; `-hf` flag auto-downloads the model + projectors to llama.cpp's cache). Per-call spawn for v1 (simple); a persistent `llama-server` is the later optimization. **Opt-in config only** (`localModel.enabled` etc.) — off by default, matching the "no CV/ML deps by default" constraint. **Use cases, in order:** (1) *audio ASR* — turns the "audio support removed" dead end into a transcript (audio → text block, still patch-free); (2) *video understanding* — it sees frames AND hears the soundtrack, so it can complement the N-frames approach with a semantic summary + audio-track transcript. **Not** for region finding — 2B vision is too weak to read fine text or pinpoint coordinates; trace stays the approach. **Risks:** 2B quality (English ASR best, others weaker; video understanding is "what's happening" level, not fine-detail), first-use ~1.5 GB download + model load, CPU latency on long audio (needs a duration cap or "too long" note).
 - **Resize options exposure:** whether to let the model control image resize parameters.
 

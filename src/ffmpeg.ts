@@ -16,9 +16,6 @@ import ffmpeg from "@ffmpeg-installer/ffmpeg";
 /** The bundled ffmpeg binary path. */
 export const ffmpegPath: string = ffmpeg.path;
 
-/** Appended as a model-visible text block when zoom is requested but cropping fell back to the full frame. */
-export const ZOOM_UNAVAILABLE_HINT = "zoom region unavailable — returning full page";
-
 /**
  * Run ffmpeg with args, rejecting on non-zero exit. Shared by the gate,
  * video frame extraction, and crop paths.

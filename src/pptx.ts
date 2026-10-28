@@ -17,9 +17,10 @@ import { readPdf } from "./pdf.js";
  */
 export async function readPptx(
 	path: string,
-	params: { pages?: string; mode?: "text" | "image"; toc?: boolean; search?: string; dpi?: number; zoom?: { x: number; y: number; w: number; h: number } },
+	params: { pages?: string; mode?: "text" | "image"; toc?: boolean; search?: string; dpi?: number; trace?: { x?: number; y?: number; w?: number; h?: number; lines?: number } },
 	config: PluginConfig,
 	input: string[],
+	sessionId: string,
 ): Promise<import("./readExtended.js").AgentToolResult> {
 	const { pptxToPdf } = await import("@s8fy/pptx-converter");
 	try {
@@ -30,7 +31,7 @@ export async function readPptx(
 		const pdfPath = join(tmpDir, "converted.pdf");
 		await writeFile(pdfPath, result.data);
 		try {
-			return await readPdf(pdfPath, params, config, input);
+			return await readPdf(pdfPath, params, config, input, sessionId);
 		} finally {
 			await rm(tmpDir, { recursive: true }).catch(() => {});
 		}
