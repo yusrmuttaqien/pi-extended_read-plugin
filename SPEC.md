@@ -391,7 +391,7 @@ Ordered by dependency: foundational work first, then what builds on it, then ind
 
 **Built on patch-eviction**
 
-- **Trace (region-finding v2, replaces `zoom`/`grid`/`locate`)** — a tracing mode for zooming: when the model wants to crop a region it can see but not pinpoint, the tool overlays numbered guiding lines on the image so the model can read coordinates directly instead of guessing (avoids repeat zoom calls just to get it right). **Purge `grid` + `locate` first** (on a new branch) before implementing trace. Design:
+- **Trace (region-finding v2, replaces `zoom`/`grid`/`locate`)** — a tracing mode for zooming: when the model wants to crop a region it can see but not pinpoint, the tool overlays numbered guiding lines on the image so the model can read coordinates directly instead of guessing (avoids repeat zoom calls just to get it right). `grid` + `locate` are purged (PR #2); `zoom` remains until trace subsumes it. Design:
   - **Scope (v1):** static images only — direct formats, converted formats, PDF image mode, and GIF (as static/first frame; animation dropped). Video frames deferred (time dimension).
   - **Two modes:** (1) *trace* (no coords) — overlay numbered guiding lines, return the numbered image + temp path; (2) *crop* (with coords) — crop at those coords, return the cropped image + new temp path. Trace subsumes `zoom` (crop), `grid`, and `locate` (finding).
   - **Crop from the untraced original:** the crop always operates on the original untraced image (full resolution, no guiding lines/numbers), never the traced overlay version or a converted/compressed version.
