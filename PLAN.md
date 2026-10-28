@@ -22,7 +22,7 @@ Branches 4–6 are independent (no deps on 1–3 or each other); land in any ord
 ## Notes
 
 - **Patch eviction** stays one branch: its 4 changes are interdependent and the patch deletion must land last. Split into `gate` / `video+audio` / `jpeg+patch-deletion` only if review gets painful.
-- **Pending (not branches yet):** Resize options exposure (open decision), Compaction interleave (blocked on a future pi compaction feature).
+- **Pending (not branches yet):** Resize options exposure (open decision), Compaction interleave (blocked on a future pi compaction feature), Local omni model (SPEC §14 — wants a branch after `patch-eviction`, not committed yet).
 
 ## Conventions
 
