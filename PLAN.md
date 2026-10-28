@@ -8,7 +8,7 @@ Execution tracker for the future work defined in **SPEC.md §13**. The SPEC is t
 |---|--------|----------|--------|
 | 1 | `purge-grid-locate` | Purge `grid` + `locate`: params, `src/region.ts`, dispatch branches, tests, docs. Prerequisite for trace. | done (PR #2) |
 | 2 | `patch-eviction` | Patch eviction: ffmpeg gate → video-as-frames → audio out → JPEG standardization → delete `src/patch/` + `/extended-read-patch`. End state: patch-free. | done (PR #3) |
-| 3 | `trace` | Trace (region-finding v2): numbered overlay + crop-from-untraced-original, 0-100 coords, split-for-legibility, temp reuse, `/extended-read-clean`, per-session temp dir. | pending |
+| 3 | `trace` | Trace (region-finding v2): numbered overlay + crop-from-untraced-original, 0-100 coords, split-for-legibility, temp reuse, `/extended-read-clean`, per-session temp dir. | done |
 | 4 | `docx` | DOCX reader (`mammoth`). | pending |
 | 5 | `pages` | Pages (`.pages`) reader (macOS-only). | pending |
 | 6 | `notebook` | Notebook (`.ipynb`) reader. | pending |
@@ -17,11 +17,12 @@ Branches 4–6 are independent (no deps on 1–3 or each other); land in any ord
 
 ## Next up
 
-**Branch 3 — `trace`.** Region-finding v2: numbered guiding-line overlay + crop-from-untraced-original, 0–100 coords, split-for-legibility, temp reuse, `/extended-read-clean`, per-session temp dir. Design is in SPEC §13.
+**Branch 4 — `docx`.** DOCX reader via `mammoth` (pure JS, no PDF conversion). Design is in SPEC §13.
 
 ## Notes
 
 - **Patch eviction** (done, PR #3): the 4 changes were interdependent and the patch deletion landed last, in the same branch.
+- **Trace** (done): landed directly on `main` (no branch/PR) — a deviation from the branch+PR convention used for branches 1–2.
 - **Pending (not branches yet):** Resize options exposure (open decision), Compaction interleave (blocked on a future pi compaction feature), Local omni model (SPEC §13 — wants a branch after `patch-eviction`, not committed yet).
 
 ## Conventions
