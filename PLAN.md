@@ -7,7 +7,7 @@ Execution tracker for the future work defined in **SPEC.md §13**. The SPEC is t
 | # | Branch | Contains | Status |
 |---|--------|----------|--------|
 | 1 | `purge-grid-locate` | Purge `grid` + `locate`: params, `src/region.ts`, dispatch branches, tests, docs. Prerequisite for trace. | done (PR #2) |
-| 2 | `patch-eviction` | Patch eviction: ffmpeg gate → video-as-frames → audio out → JPEG standardization → delete `src/patch/` + `/extended-read-patch`. End state: patch-free. | in progress |
+| 2 | `patch-eviction` | Patch eviction: ffmpeg gate → video-as-frames → audio out → JPEG standardization → delete `src/patch/` + `/extended-read-patch`. End state: patch-free. | done (PR #3) |
 | 3 | `trace` | Trace (region-finding v2): numbered overlay + crop-from-untraced-original, 0-100 coords, split-for-legibility, temp reuse, `/extended-read-clean`, per-session temp dir. | pending |
 | 4 | `docx` | DOCX reader (`mammoth`). | pending |
 | 5 | `pages` | Pages (`.pages`) reader (macOS-only). | pending |
@@ -17,11 +17,11 @@ Branches 4–6 are independent (no deps on 1–3 or each other); land in any ord
 
 ## Next up
 
-**Branch 2 — `patch-eviction`.** The foundational unit: ffmpeg gate replaces Photon, video as frames, audio out, JPEG standardization, then delete `src/patch/` + `/extended-read-patch`. End state: patch-free.
+**Branch 3 — `trace`.** Region-finding v2: numbered guiding-line overlay + crop-from-untraced-original, 0–100 coords, split-for-legibility, temp reuse, `/extended-read-clean`, per-session temp dir. Design is in SPEC §13.
 
 ## Notes
 
-- **Patch eviction** stays one branch: its 4 changes are interdependent and the patch deletion must land last. Split into `gate` / `video+audio` / `jpeg+patch-deletion` only if review gets painful.
+- **Patch eviction** (done, PR #3): the 4 changes were interdependent and the patch deletion landed last, in the same branch.
 - **Pending (not branches yet):** Resize options exposure (open decision), Compaction interleave (blocked on a future pi compaction feature), Local omni model (SPEC §13 — wants a branch after `patch-eviction`, not committed yet).
 
 ## Conventions
