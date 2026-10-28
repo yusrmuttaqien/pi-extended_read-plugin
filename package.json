@@ -1,29 +1,29 @@
 {
-  "name": "pi-extendedread-plugin",
-  "version": "0.1.0",
-  "description": "Pi extension: extendedRead tool for media files (images, audio, video, PDF, PPTX) with native serialization",
-  "type": "module",
-  "pi": {
-    "extensions": [
-      "./src/index.ts"
-    ]
-  },
-  "scripts": {
-    "build": "tsc",
-    "test": "node --test dist/test/*.test.js",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@ffmpeg-installer/ffmpeg": "^1.1.0",
-    "@s8fy/pptx-converter": "^1.5.3",
-    "mupdf": "^1.28.1"
-  },
-  "peerDependencies": {
-    "typebox": "^1.3.27"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.1.0",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.5.0"
-  }
+	"name": "pi-extendedread-plugin",
+	"version": "0.1.0",
+	"description": "Pi extension: extendedRead tool for media files (images, video frames, PDF, PPTX)",
+	"type": "module",
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"build": "tsc",
+		"test": "node --test dist/test/*.test.js",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@ffmpeg-installer/ffmpeg": "^1.1.0",
+		"@s8fy/pptx-converter": "^1.5.3",
+		"mupdf": "^1.28.1"
+	},
+	"peerDependencies": {
+		"typebox": "^1.3.27"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^22.0.0",
+		"typescript": "^5.5.0"
+	}
 }

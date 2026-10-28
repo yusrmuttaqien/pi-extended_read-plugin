@@ -20,23 +20,18 @@ export const ffmpegPath: string = ffmpeg.path;
 export const ZOOM_UNAVAILABLE_HINT = "zoom region unavailable — returning full page";
 
 /**
- * Convert an input file to a target format via ffmpeg.
- * Returns the output temp file path (caller must unlink).
+ * Run ffmpeg with args, rejecting on non-zero exit. Shared by the gate,
+ * video frame extraction, and crop paths.
  */
-export function ffmpegConvert(
-	inputPath: string,
-	targetExt: string,
-	timeoutMs: number,
-): Promise<string> {
-	const outputPath = join(tmpdir(), `pi-media-${process.pid}-${randomUUID()}.${targetExt}`);
+export function runFfmpeg(bin: string, args: string[], timeoutMs: number): Promise<void> {
 	return new Promise((resolveP, rejectP) => {
 		execFile(
-			ffmpegPath,
-			["-y", "-i", inputPath, outputPath],
+			bin,
+			args,
 			{ timeout: timeoutMs },
 			(err) => {
 				if (err) rejectP(err);
-				else resolveP(outputPath);
+				else resolveP();
 			},
 		);
 	});
@@ -143,12 +138,34 @@ export function renderProbeText(info: ProbeInfo | null, size: number, ext: strin
 }
 
 /**
+ * Parse an ffmpeg duration string ("HH:MM:SS.xx" or "MM:SS.xx") into
+ * seconds. Returns 0 for missing/unparseable input.
+ */
+export function parseDurationSec(duration: string | undefined): number {
+	if (!duration) return 0;
+	const m = duration.match(/^(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$/);
+	if (!m) return 0;
+	const h = m[1] ? parseInt(m[1], 10) : 0;
+	return h * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+}
+
+/** Format seconds as m:ss or h:mm:ss. */
+export function formatTime(sec: number): string {
+	const h = Math.floor(sec / 3600);
+	const m = Math.floor((sec % 3600) / 60);
+	const s = Math.floor(sec % 60);
+	return h > 0
+		? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+		: `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
  * Extract an image's pixel dimensions via ffmpeg's probe output.
  * Returns null on any failure (caller falls back to no-zoom).
  */
-export async function imageDims(inputPath: string): Promise<{ width: number; height: number } | null> {
+export async function imageDims(inputPath: string, timeoutMs = 10_000): Promise<{ width: number; height: number } | null> {
 	try {
-		const { stderr } = await runCmd(ffmpegPath, ["-hide_banner", "-i", inputPath, "-vframes", "1", "-f", "null", "-"]);
+		const { stderr } = await runCmd(ffmpegPath, ["-hide_banner", "-i", inputPath, "-vframes", "1", "-f", "null", "-"], timeoutMs);
 		return parseFfmpegDims(stderr);
 	} catch {
 		/* fall through to no-zoom */
@@ -172,41 +189,46 @@ export function parseFfmpegDims(stderr: string): { width: number; height: number
 
 /**
  * Crop a region of an image raster (any ffmpeg-decodable input) at normalized
- * [x,y,w,h] fractions, returning the cropped PNG bytes. Returns null if
- * dimensions can't be resolved.
+ * [x,y,w,h] fractions, writing the crop to a temp file in `targetExt`.
+ * Returns the output path (caller must unlink), or null if dimensions can't
+ * be resolved or the crop fails.
  */
-export async function cropRegionToPng(
+export async function cropRegion(
 	inputPath: string,
 	zoom: { x: number; y: number; w: number; h: number },
+	targetExt: string,
 	timeoutMs: number,
-): Promise<Buffer | null> {
-	const dims = await imageDims(inputPath);
-	if (!dims)
-		return null;
-	return cropRegionToPngWithDims(inputPath, zoom, dims, timeoutMs);
+): Promise<string | null> {
+	const dims = await imageDims(inputPath, timeoutMs);
+	if (!dims) return null;
+	return cropRegionWithDims(inputPath, zoom, dims, targetExt, timeoutMs);
 }
 
 /**
  * Crop a region given pre-computed pixel dimensions (skips the per-call ffmpeg
- * probe). Returns null on failure.
+ * probe). Returns the output temp path (caller must unlink), or null on failure.
  */
-export async function cropRegionToPngWithDims(
+export async function cropRegionWithDims(
 	inputPath: string,
 	zoom: { x: number; y: number; w: number; h: number },
 	dims: { width: number; height: number },
+	targetExt: string,
 	timeoutMs: number,
-): Promise<Buffer | null> {
-	const W = Math.max(1, Math.round(zoom.w * dims.width));
-	const H = Math.max(1, Math.round(zoom.h * dims.height));
+): Promise<string | null> {
+	// JPEG targets require even dimensions (yuv420p); round down.
+	const even = targetExt === "jpg" ? 2 : 1;
+	const W = Math.max(even, Math.round(zoom.w * dims.width / even) * even);
+	const H = Math.max(even, Math.round(zoom.h * dims.height / even) * even);
 	const maxX = Math.max(0, dims.width - W);
 	const maxY = Math.max(0, dims.height - H);
 	const X = Math.min(Math.floor(zoom.x * dims.width), maxX);
 	const Y = Math.min(Math.floor(zoom.y * dims.height), maxY);
-	const outPath = join(tmpdir(), `pi-zoom-${process.pid}-${randomUUID()}.png`);
+	const outPath = join(tmpdir(), `extread-crop-${process.pid}-${randomUUID()}.${targetExt}`);
 	try {
-		await runCmd(ffmpegPath, ["-y", "-i", inputPath, "-vf", `crop=${W}:${H}:${X}:${Y}`, outPath]);
-		return await readFile(outPath);
-	} finally {
+		await runCmd(ffmpegPath, ["-y", "-v", "error", "-i", inputPath, "-vf", `crop=${W}:${H}:${X}:${Y}`, outPath], timeoutMs);
+		return outPath;
+	} catch {
 		await unlink(outPath).catch(() => {});
+		return null;
 	}
 }

@@ -1,41 +1,48 @@
 {
-  "$docs": {
-    "models": {
-      "$description": "Map of model_id → model-specific settings. Unknown models fall back to 'defaults'.",
-      "input": "Modalities the model can receive. Valid: 'text', 'image', 'audio', 'video'. Controls which media types extendedRead returns. If 'audio' is absent, audio files return a note instead of media.",
-      "maxBytes": {
-        "$description": "Per-modality size caps (bytes). Larger files return a note.",
-        "image": "Default: 10485760 (10 MB).",
-        "audio": "Default: 20971520 (20 MB).",
-        "video": "Default: 52428800 (50 MB)."
-      }
-    },
-    "defaults": {
-      "$description": "Fallback for models not listed in 'models'.",
-      "input": "Same as models.input. Default: ['text', 'image'].",
-      "maxBytes": "Same as models.maxBytes.",
-      "executionMode": "'parallel' (concurrent reads) or 'sequential'. Default: 'parallel'.",
-      "ffmpegTimeoutMs": "ffmpeg conversion timeout (ms). Default: 30000.",
-      "pdf": {
-        "$description": "PDF reading settings.",
-        "defaultDpi": "Resolution for image mode (DPI). Default: 150.",
-        "maxPagesPerCall": "Max pages per tool call. Default: 10."
-      }
-    }
-  },
-  "models": {},
-  "defaults": {
-    "input": ["text", "image"],
-    "maxBytes": {
-      "image": 10485760,
-      "audio": 20971520,
-      "video": 52428800
-    },
-    "executionMode": "parallel",
-    "ffmpegTimeoutMs": 30000,
-    "pdf": {
-      "defaultDpi": 150,
-      "maxPagesPerCall": 10
-    }
-  }
+	"$docs": {
+		"models": {
+			"$description": "Map of model_id → model-specific settings. Unknown models fall back to 'defaults'.",
+			"input": "Modalities the model can receive. Valid: 'text', 'image'. Controls which media types extendedRead returns. Video is read as image frames, so 'image' is required for video too. If 'image' is absent, image/video files return a note instead of media.",
+			"maxBytes": {
+				"$description": "Per-modality size caps (bytes). Larger files return a note.",
+				"image": "Default: 10485760 (10 MB). Video bypasses the cap (frame count scales with duration); audio is probe-only (info=true)."
+			}
+		},
+		"defaults": {
+			"$description": "Fallback for models not listed in 'models'.",
+			"input": "Same as models.input. Default: ['text', 'image'].",
+			"maxBytes": "Same as models.maxBytes.",
+			"executionMode": "'parallel' (concurrent reads) or 'sequential'. Default: 'parallel'.",
+			"ffmpegTimeoutMs": "ffmpeg timeout (ms) for conversion, cropping, gating, and frame extraction. Default: 30000.",
+			"imageGate": {
+				"$description": "The ffmpeg image gate every emitted raster passes through.",
+				"maxDim": "Max width or height after gating (px). Over-limit images are downscaled. Default: 2000.",
+				"maxBytes": "Base64 budget (bytes) for the serialized image; the quality ladder steps down to fit. Default: 4718592 (4.5 MB).",
+				"jpegQuality": "Starting JPEG quality (1-100) for derived rasters; the ladder steps down by 5 to 65. Default: 80."
+			},
+			"pdf": {
+				"$description": "PDF reading settings.",
+				"defaultDpi": "Resolution for image mode (DPI). Default: 150.",
+				"maxPagesPerCall": "Max pages per tool call. Default: 10."
+			}
+		}
+	},
+	"models": {},
+	"defaults": {
+		"input": ["text", "image"],
+		"maxBytes": {
+			"image": 10485760
+		},
+		"imageGate": {
+			"maxDim": 2000,
+			"maxBytes": 4718592,
+			"jpegQuality": 80
+		},
+		"executionMode": "parallel",
+		"ffmpegTimeoutMs": 30000,
+		"pdf": {
+			"defaultDpi": 150,
+			"maxPagesPerCall": 10
+		}
+	}
 }

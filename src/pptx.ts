@@ -20,7 +20,7 @@ export async function readPptx(
 	params: { pages?: string; mode?: "text" | "image"; toc?: boolean; search?: string; dpi?: number; zoom?: { x: number; y: number; w: number; h: number } },
 	config: PluginConfig,
 	input: string[],
-): Promise<{ content: { type: string; text?: string; data?: string; mimeType?: string }[]; isError?: boolean }> {
+): Promise<import("./readExtended.js").AgentToolResult> {
 	const { pptxToPdf } = await import("@s8fy/pptx-converter");
 	try {
 		const pptxBuffer = await readFile(path);
