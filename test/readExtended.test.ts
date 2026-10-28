@@ -2,34 +2,38 @@
  * readExtended.test.ts — tests for the extendedRead tool.
  *
  * Tests the dispatch logic: resolve, stat, size cap, capability gate,
- * format dispatch, and error handling.
+ * format dispatch, the image gate, video frames, and error handling.
  */
 
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 
 import { readExtended } from "../src/readExtended.js";
-import { cropRegionToPng, parseFfmpegDims } from "../src/ffmpeg.js";
+import { cropRegion, parseFfmpegDims, parseFfmpegProbe, renderProbeText } from "../src/ffmpeg.js";
 import type { PluginConfig } from "../src/config.js";
+import type { AgentToolResult } from "../src/readExtended.js";
 
 /** Extract text from array content. */
-function text(content: { type: string; text?: string }[]): string {
-	return content.map((c) => c.text ?? "").join("\n");
+function text(content: AgentToolResult["content"]): string {
+	return content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
 }
 
 const config: PluginConfig = {
 	models: {},
 	defaults: {
-		input: ["text", "image", "audio", "video"],
-		maxBytes: { image: 10485760, audio: 20971520, video: 52428800 },
+		input: ["text", "image"],
+		maxBytes: { image: 10485760 },
+		imageGate: { maxDim: 2000, maxBytes: 4718592, jpegQuality: 80 },
 		executionMode: "parallel",
 		ffmpegTimeoutMs: 30000,
 	},
 };
+
+// --- Basic dispatch ---
 
 test("file not found", async () => {
 	const result = await readExtended(
@@ -38,7 +42,7 @@ test("file not found", async () => {
 		config,
 	);
 	assert.equal(result.isError, true);
-	assert.match(text(result.content as any), /File not found/);
+	assert.match(text(result.content), /File not found/);
 });
 
 test("not a file (directory)", async () => {
@@ -48,7 +52,7 @@ test("not a file (directory)", async () => {
 		config,
 	);
 	assert.equal(result.isError, true);
-	assert.match(text(result.content as any), /Not a file/);
+	assert.match(text(result.content), /Not a file/);
 });
 
 test("unsupported extension", async () => {
@@ -61,7 +65,7 @@ test("unsupported extension", async () => {
 		{ cwd: dir, modelId: "test" },
 		config,
 	);
-	assert.match(text(result.content as any), /unsupported format/);
+	assert.match(text(result.content), /unsupported format/);
 
 	await rm(dir, { recursive: true });
 });
@@ -77,27 +81,7 @@ test("size cap exceeded", async () => {
 		{ cwd: dir, modelId: "test" },
 		config,
 	);
-	assert.match(text(result.content as any), /File too large/);
-
-	await rm(dir, { recursive: true });
-});
-
-test("capability gate: model doesn't support audio", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	const file = join(dir, "test.mp3");
-	await writeFile(file, Buffer.from("fake mp3 data"));
-
-	const audioConfig: PluginConfig = {
-		...config,
-		defaults: { ...config.defaults, input: ["text", "image"] },
-	};
-
-	const result = await readExtended(
-		{ path: file },
-		{ cwd: dir, modelId: "test" },
-		audioConfig,
-	);
-	assert.match(text(result.content as any), /does not support audio/);
+	assert.match(text(result.content), /File too large/);
 
 	await rm(dir, { recursive: true });
 });
@@ -108,7 +92,6 @@ test("tilde expansion", async () => {
 	await writeFile(file, "hello");
 
 	// Use ~ in the path (should expand to homedir).
-	// We can't easily test the actual homedir, so just verify it doesn't crash.
 	const result = await readExtended(
 		{ path: `~/${file.split("/").pop()}` },
 		{ cwd: dir, modelId: "test" },
@@ -120,209 +103,18 @@ test("tilde expansion", async () => {
 	await rm(dir, { recursive: true });
 });
 
-test("PDF text extraction", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	// Minimal valid PDF (1 page, empty).
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n" +
-		"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n" +
-		"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n" +
-		"xref\n0 4\n0000000000 65535 f \n" +
-		"0000000009 00000 n \n" +
-		"0000000058 00000 n \n" +
-		"0000000113 00000 n \n" +
-		"trailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
-	);
-	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
-
-	const result = await readExtended(
-		{ path: file },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	// Should return text with page count info.
-	const allText = text(result.content as any);
-	assert.match(allText, /1 pages/);
-	assert.match(allText, /Page 1/);
-
-	await rm(dir, { recursive: true });
-});
-
-test("PDF page selector", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n" +
-		"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n" +
-		"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n" +
-		"xref\n0 4\n0000000000 65535 f \n" +
-		"0000000009 00000 n \n" +
-		"0000000058 00000 n \n" +
-		"0000000113 00000 n \n" +
-		"trailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
-	);
-	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
-
-	// Request page 5 (out of range for a 1-page PDF).
-	const result = await readExtended(
-		{ path: file, pages: "5" },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	// Should not crash; out-of-range pages are silently skipped.
-	const allText = text(result.content as any);
-	assert.match(allText, /1 pages/);
-
-	await rm(dir, { recursive: true });
-});
-
-test("PDF image mode: rendered pages go through the Photon pipeline", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\nendobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\nendobj\nxref\n0 4\n0000000000 65535 f \n0000000009 0000000000 00000 n \n0000000058 0000000000 00000 n \n0000000115 0000000000 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
-	);
-	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
-
-	const result = await readExtended(
-		{ path: file, mode: "image" },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	const images = (result.content as any[]).filter((c) => c.type === "image");
-	assert.equal(images.length, 1);
-	// Valid base64 payload with an image mime type (Photon output or raw-PNG fallback).
-	assert.ok(images[0].data.length > 0);
-	assert.ok(Buffer.from(images[0].data, "base64").length > 0);
-	assert.match(images[0].mimeType, /^image\//);
-
-	await rm(dir, { recursive: true });
-});
-
-test("PDF: image mode gated by model capability", async () => {
-	const noImageConfig: PluginConfig = {
-		models: {},
-		defaults: {
-			input: ["text", "audio", "video"],
-			maxBytes: { image: 10485760, audio: 20971520, video: 52428800 },
-			executionMode: "parallel",
-			ffmpegTimeoutMs: 30000,
-		},
-	};
-	const dir = await mkdtemp(join(tmpdir(), "pi-extread-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\nendobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\nendobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
-	);
-	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
-
-	// Model without "image" capability.
-	const result = await readExtended(
-		{ path: file, mode: "image" },
-		{ cwd: dir, modelId: "test" },
-		noImageConfig,
-	);
-	const allText = text(result.content as any);
-	assert.match(allText, /does not support images/);
-
-	await rm(dir, { recursive: true });
-});
-
-test("PPTX: returns conversion failed for invalid file", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-extread-"));
-	const file = join(dir, "test.pptx");
-	await writeFile(file, Buffer.from([0x50, 0x50, 0x54, 0x58])); // minimal bytes
-
-	const result = await readExtended(
-		{ path: file },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	const allText = text(result.content as any);
-	// Should return "conversion failed" since the file is not a valid PPTX
-	assert.match(allText, /conversion failed/i);
-
-	await rm(dir, { recursive: true });
-});
-
-test("image direct: PNG dispatch reaches image handler", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	// Minimal valid 1x1 PNG — we're testing dispatch, not the resize pipeline.
-	const pngBytes = Buffer.from(
-		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAAHXuKfwAAAABJRU5ErkJggg==",
-		"base64",
-	);
-	const file = join(dir, "test.png");
-	await writeFile(file, pngBytes);
-
-	// In the test environment, Photon WASM (pi's image resize engine) is
-	// unavailable, so processImage throws. This proves dispatch reached
-	// the image handler (file recognized as PNG, capability gate passed).
-	await assert.rejects(
-		readExtended({ path: file }, { cwd: dir, modelId: "test" }, config),
-		/resize|Image|Photon/i,
-	);
-
-	await rm(dir, { recursive: true });
-});
-
-test("audio direct: WAV returns audio block", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	// Minimal WAV header (RIFF + 44 bytes)
-	const wavBytes = Buffer.alloc(44);
-	wavBytes.write("RIFF", 0);
-	wavBytes.write("WAVE", 8);
-	wavBytes.write("fmt ", 12);
-	const file = join(dir, "test.wav");
-	await writeFile(file, wavBytes);
-
-	const result = await readExtended(
-		{ path: file },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	const blocks = result.content as any[];
-	assert.ok(blocks.some((b) => b.type === "audio"));
-
-	await rm(dir, { recursive: true });
-});
-
-test("video direct: MP4 returns video block", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	// Minimal MP4 header (ftyp box)
-	const mp4Bytes = Buffer.from([
-		0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, // ftyp box
-		0x69, 0x73, 0x6f, 0x6d, 0x20, 0x20, 0x20, 0x20,
-	]);
-	const file = join(dir, "test.mp4");
-	await writeFile(file, mp4Bytes);
-
-	const result = await readExtended(
-		{ path: file },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	const blocks = result.content as any[];
-	assert.ok(blocks.some((b) => b.type === "video"));
-
-	await rm(dir, { recursive: true });
-});
+// --- Capability gate ---
 
 test("capability gate: model doesn't support images", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	const pngBytes = Buffer.from(
-		"iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAACXBIWXMAAAABAAAAAQBPJcTWAAAA50lEQVR4nO3QsQkAIADAMAX/v9jBF+wkQnJB6dyDW+t1wE/MCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKzArMCswKDqR1Aoosepp1AAAAAElFTkSuQmCC",
-		"base64",
-	);
 	const file = join(dir, "test.png");
-	await writeFile(file, pngBytes);
+	await writeFile(file, Buffer.alloc(10));
 
 	const noImageConfig: PluginConfig = {
 		models: {},
 		defaults: {
-			input: ["text", "audio", "video"],
-			maxBytes: { image: 10485760, audio: 20971520, video: 52428800 },
+			input: ["text"],
+			maxBytes: { image: 10485760 },
 			executionMode: "parallel",
 			ffmpegTimeoutMs: 30000,
 		},
@@ -333,106 +125,12 @@ test("capability gate: model doesn't support images", async () => {
 		{ cwd: dir, modelId: "test" },
 		noImageConfig,
 	);
-	const allText = text(result.content as any);
-	assert.match(allText, /does not support images/);
+	assert.match(text(result.content), /does not support images/);
 
 	await rm(dir, { recursive: true });
 });
 
-test("capability gate: model doesn't support video", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	const mp4Bytes = Buffer.from([
-		0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x20, 0x20, 0x20, 0x20,
-	]);
-	const file = join(dir, "test.mp4");
-	await writeFile(file, mp4Bytes);
-
-	const noVideoConfig: PluginConfig = {
-		models: {},
-		defaults: {
-			input: ["text", "image", "audio"],
-			maxBytes: { image: 10485760, audio: 20971520, video: 52428800 },
-			executionMode: "parallel",
-			ffmpegTimeoutMs: 30000,
-		},
-	};
-
-	const result = await readExtended(
-		{ path: file },
-		{ cwd: dir, modelId: "test" },
-		noVideoConfig,
-	);
-	const allText = text(result.content as any);
-	assert.match(allText, /does not support video/);
-
-	await rm(dir, { recursive: true });
-});
-
-// --- PDF TOC, Search, DPI tests ---
-
-test("PDF: toc=true returns outline", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	// Create a minimal PDF with an outline using mupdf
-	const mupdf = await import("mupdf") as any;
-	// Use a simple PDF that has text (no outline) to test the "no outline" path
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\ntrailer<</Size 4/Root 1 0 R>>\n%%EOF",
-	);
-	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
-
-	const result = await readExtended(
-		{ path: file, toc: true },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	const allText = text(result.content as any);
-	assert.match(allText, /no table of contents/i);
-
-	await rm(dir, { recursive: true });
-});
-
-test("PDF: search returns no matches for absent text", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\ntrailer<</Size 4/Root 1 0 R>>\n%%EOF",
-	);
-	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
-
-	const result = await readExtended(
-		{ path: file, search: "nonexistent text that is not in the pdf" },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	const allText = text(result.content as any);
-	assert.match(allText, /No matches/i);
-
-	await rm(dir, { recursive: true });
-});
-
-test("PDF: dpi parameter is accepted (image mode)", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "extread-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\ntrailer<</Size 4/Root 1 0 R>>\n%%EOF",
-	);
-	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
-
-	// Image mode with dpi — minimal PDF has no content, so toPixmap succeeds
-	// (blank page). Proves the dpi param is accepted and dispatch works.
-	const result = await readExtended(
-		{ path: file, mode: "image", dpi: 300 },
-		{ cwd: dir, modelId: "test" },
-		config,
-	);
-	const allText = text(result.content as any);
-	assert.match(allText, /300 DPI/);
-
-	await rm(dir, { recursive: true });
-});
-
-// --- Region zoom tests ---
+// --- Image gate ---
 
 /** Read PNG pixel dimensions straight from the IHDR header (no external tools). */
 function pngDims(buf: Buffer): [number, number] | null {
@@ -459,29 +157,350 @@ async function makePng(width: number, height: number, color: string, targetDir?:
 	return out;
 }
 
-/**
- * Assert that a zoomed image read reached pi's resize pipeline (processImageBytes).
- * This is true whether processImage succeeds (resolve with an image block) or throws on
- * ok:false (reject matching the resize/Photon error), so it robustly proves the new crop
- * code path was taken regardless of pi's opaque success/fail behavior.
- */
-async function expectRoutedThroughPipeline(promise: Promise<{ content?: any[]; isError?: boolean }>): Promise<void> {
-	try {
-		const r = await promise;
-		assert.ok(r.isError !== true, "expected no error when the pipeline succeeds");
-		assert.ok((r.content as any[]).some((b) => b.type === "image"), "expected an image block");
-	} catch (e: any) {
-		assert.match(String(e.message ?? e), /resize|Image|Photon/i);
-	}
+test("image direct: small PNG passes the gate and returns an image block", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = await makePng(100, 80, "green", dir);
+
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
+	assert.equal(images.length, 1);
+	assert.ok(Buffer.from(images[0].data!, "base64").length > 0);
+
+	await rm(dir, { recursive: true });
+});
+
+test("gate: over-limit direct PNG is downscaled to maxDim (re-encoded as PNG)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = await makePng(3000, 2000, "green", dir);
+
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
+	assert.equal(images.length, 1);
+	// Direct formats re-encode in their own format (never cross-converted).
+	assert.equal(images[0].mimeType, "image/png");
+	const dims = pngDims(Buffer.from(images[0].data!, "base64"));
+	assert.ok(dims, "expected a decodable PNG");
+	assert.ok(dims![0] <= 2000 && dims![1] <= 2000, `expected dims within maxDim, got ${dims![0]}x${dims![1]}`);
+
+	await rm(dir, { recursive: true });
+});
+
+/** Generate a multi-frame animated GIF via ffmpeg (regression fixture). */
+async function makeMultiFrameGif(targetDir: string): Promise<string> {
+	const { path: bin } = await import("@ffmpeg-installer/ffmpeg");
+	const out = join(targetDir, "gen-multi.gif");
+	await new Promise<void>((res, rej) => {
+		execFile(
+			bin,
+			["-y", "-f", "lavfi", "-i", "color=c=blue:s=2100x1500:r=2:d=1", out],
+			{ timeout: 20_000 },
+			(err) => (err ? rej(err) : res()),
+		);
+	});
+	return out;
 }
 
+test("gate: over-limit multi-frame GIF re-encodes to a single PNG (first frame)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = await makeMultiFrameGif(dir);
+
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
+	assert.equal(images.length, 1);
+	// Direct formats re-encode in their own format (gif → png, first frame).
+	assert.equal(images[0].mimeType, "image/png");
+	assert.ok(images[0].data!.length > 0);
+
+	await rm(dir, { recursive: true });
+});
+
+// --- Audio: probe-only ---
+
+test("audio: WAV returns a probe-only note (no media block)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const wavBytes = Buffer.alloc(44);
+	wavBytes.write("RIFF", 0);
+	wavBytes.write("WAVE", 8);
+	wavBytes.write("fmt ", 12);
+	const file = join(dir, "test.wav");
+	await writeFile(file, wavBytes);
+
+	const result = await readExtended(
+		{ path: file },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	const allText = text(result.content);
+	assert.match(allText, /audio support removed/);
+	assert.match(allText, /info=true/);
+	const blocks = result.content as { type: string }[];
+	assert.ok(!blocks.some((b) => b.type !== "text"), "expected no media blocks");
+
+	await rm(dir, { recursive: true });
+});
+
+// --- Video: frames ---
+
+/** Generate a tiny mp4 with video via ffmpeg lavfi (self-contained fixture). */
+async function genMp4(file: string, seconds = 2): Promise<void> {
+	const { path: bin } = await import("@ffmpeg-installer/ffmpeg");
+	await new Promise<void>((res, rej) => {
+		execFile(
+			bin,
+			["-y", "-f", "lavfi", "-i", `testsrc=size=64x48:rate=25:duration=${seconds}`, "-pix_fmt", "yuv420p", file],
+			{ timeout: 30_000 },
+			(err) => (err ? rej(err) : res()),
+		);
+	});
+}
+
+test("video: 2s mp4 auto-frames to two image blocks (auto minimum)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.mp4");
+	await genMp4(file, 2);
+
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((b) => b.type === "image");
+	assert.equal(images.length, 2);
+	assert.equal(images[0].mimeType, "image/jpeg");
+	assert.match(text(result.content), /2 frames/);
+	assert.match(text(result.content), /audio/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("video: frames=3 extracts three frames", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.mp4");
+	await genMp4(file, 4);
+
+	const result = await readExtended({ path: file, frames: 3 }, { cwd: dir, modelId: "test" }, config);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string }[]).filter((b) => b.type === "image");
+	assert.equal(images.length, 3);
+	assert.match(text(result.content), /3 frames/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("video: frames=0 returns a validation note", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.mp4");
+	await genMp4(file, 2);
+
+	const result = await readExtended({ path: file, frames: 0 }, { cwd: dir, modelId: "test" }, config);
+	assert.match(text(result.content), /frames must be between 1 and 16/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("video: frames=17 returns a validation note", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.mp4");
+	await genMp4(file, 2);
+
+	const result = await readExtended({ path: file, frames: 17 }, { cwd: dir, modelId: "test" }, config);
+	assert.match(text(result.content), /frames must be between 1 and 16/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("video: extraction failure returns a note (no crash)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	// Fake mp4 header — probe fails.
+	const file = join(dir, "test.mp4");
+	await writeFile(file, Buffer.from([0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70]));
+
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, config);
+	assert.match(text(result.content), /frame extraction failed/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("video: capability gate (no image support)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.mp4");
+	await genMp4(file, 2);
+
+	const noImageConfig: PluginConfig = {
+		models: {},
+		defaults: {
+			input: ["text"],
+			maxBytes: { image: 10485760 },
+			executionMode: "parallel",
+			ffmpegTimeoutMs: 30000,
+		},
+	};
+
+	const result = await readExtended({ path: file }, { cwd: dir, modelId: "test" }, noImageConfig);
+	assert.match(text(result.content), /does not support images/);
+
+	await rm(dir, { recursive: true });
+});
+
+// --- PDF ---
+
+const PDF_BYTES = Buffer.from(
+	"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n" +
+	"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n" +
+	"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n" +
+	"xref\n0 4\n0000000000 65535 f \n" +
+	"0000000009 00000 n \n" +
+	"0000000058 00000 n \n" +
+	"0000000113 00000 n \n" +
+	"trailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
+);
+
+test("PDF text extraction", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.pdf");
+	await writeFile(file, PDF_BYTES);
+
+	const result = await readExtended(
+		{ path: file },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	const allText = text(result.content);
+	assert.match(allText, /1 pages/);
+	assert.match(allText, /Page 1/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("PDF page selector", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.pdf");
+	await writeFile(file, PDF_BYTES);
+
+	// Request page 5 (out of range for a 1-page PDF).
+	const result = await readExtended(
+		{ path: file, pages: "5" },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	// Should not crash; out-of-range pages are silently skipped.
+	const allText = text(result.content);
+	assert.match(allText, /1 pages/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("PDF image mode: rendered pages go through the gate (JPEG)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.pdf");
+	await writeFile(file, PDF_BYTES);
+
+	const result = await readExtended(
+		{ path: file, mode: "image" },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	const images = (result.content as { type: string; data?: string; mimeType?: string }[]).filter((c) => c.type === "image");
+	assert.equal(images.length, 1);
+	assert.ok(images[0].data!.length > 0);
+	assert.ok(Buffer.from(images[0].data!, "base64").length > 0);
+	assert.match(images[0].mimeType!, /^image\//);
+
+	await rm(dir, { recursive: true });
+});
+
+test("PDF: image mode gated by model capability", async () => {
+	const noImageConfig: PluginConfig = {
+		models: {},
+		defaults: {
+			input: ["text"],
+			maxBytes: { image: 10485760 },
+			executionMode: "parallel",
+			ffmpegTimeoutMs: 30000,
+		},
+	};
+	const dir = await mkdtemp(join(tmpdir(), "pi-extread-"));
+	const file = join(dir, "test.pdf");
+	await writeFile(file, PDF_BYTES);
+
+	const result = await readExtended(
+		{ path: file, mode: "image" },
+		{ cwd: dir, modelId: "test" },
+		noImageConfig,
+	);
+	const allText = text(result.content);
+	assert.match(allText, /does not support images/);
+
+	await rm(dir, { recursive: true });
+});
+
+test("PDF: toc=true returns outline", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.pdf");
+	await writeFile(file, PDF_BYTES);
+
+	const result = await readExtended(
+		{ path: file, toc: true },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	const allText = text(result.content);
+	assert.match(allText, /no table of contents/i);
+
+	await rm(dir, { recursive: true });
+});
+
+test("PDF: search returns no matches for absent text", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.pdf");
+	await writeFile(file, PDF_BYTES);
+
+	const result = await readExtended(
+		{ path: file, search: "nonexistent text that is not in the pdf" },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	const allText = text(result.content);
+	assert.match(allText, /No matches/i);
+
+	await rm(dir, { recursive: true });
+});
+
+test("PDF: dpi parameter is accepted (image mode)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "extread-"));
+	const file = join(dir, "test.pdf");
+	await writeFile(file, PDF_BYTES);
+
+	const result = await readExtended(
+		{ path: file, mode: "image", dpi: 300 },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	const allText = text(result.content);
+	assert.match(allText, /300 DPI/);
+
+	await rm(dir, { recursive: true });
+});
+
+// --- PPTX ---
+
+test("PPTX: returns conversion failed for invalid file", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-extread-"));
+	const file = join(dir, "test.pptx");
+	await writeFile(file, Buffer.from([0x50, 0x50, 0x54, 0x58])); // minimal bytes
+
+	const result = await readExtended(
+		{ path: file },
+		{ cwd: dir, modelId: "test" },
+		config,
+	);
+	const allText = text(result.content);
+	assert.match(allText, /conversion failed/i);
+
+	await rm(dir, { recursive: true });
+});
+
 // --- parseFfmpegDims: guard against the memory-pointer regression ---
-//
-// Real screenshots (and sips re-encodes of them) make ffmpeg print
-// "[png_pipe @ 0x137808200] Stream #0: not enough frames to estimate rate" *before*
-// the "Video: ... WxH" descriptor line. A bare \d+x\d+ regex matched the hex pointer
-// first, yielding width=0 and a spurious null -> "zoom region unavailable". These
-// tests pin the anchored-regex fix without depending on a PNG that triggers the warning.
 
 test("parseFfmpegDims ignores the memory pointer in the 'not enough frames' warning", () => {
 	const stderr =
@@ -505,137 +524,137 @@ test("parseFfmpegDims returns null when no valid Video line is present", () => {
 	assert.equal(parseFfmpegDims(""), null);
 });
 
-test("cropRegionToPng crops a full-frame fraction to expected dimensions", async () => {
+// --- cropRegion ---
+
+test("cropRegion crops a full-frame fraction to expected dimensions", async () => {
 	const src = await makePng(500, 300, "green");
 	try {
-		const buf = await cropRegionToPng(src, { x: 0, y: 0, w: 0.5, h: 0.5 }, 30_000);
-		assert.ok(buf, "expected a cropped buffer");
-		assert.deepEqual(pngDims(buf as Buffer), [250, 150]);
+		const out = await cropRegion(src, { x: 0, y: 0, w: 0.5, h: 0.5 }, "png", 30_000);
+		assert.ok(out, "expected a cropped file");
+		const buf = await readFile(out!);
+		assert.deepEqual(pngDims(buf), [250, 150]);
 	} finally {
 		await rm(src.split("/").slice(0, -1).join("/"), { recursive: true });
 	}
 });
 
-test("cropRegionToPng handles an offset fraction", async () => {
+test("cropRegion handles an offset fraction", async () => {
 	const src = await makePng(500, 300, "red");
 	try {
-		const buf = await cropRegionToPng(src, { x: 0.25, y: 0.5, w: 0.5, h: 0.5 }, 30_000);
-		assert.ok(buf, "expected a cropped buffer");
-		// boxPx = (125, 150, 250, 150); output dimensions are w x h.
-		assert.deepEqual(pngDims(buf as Buffer), [250, 150]);
+		const out = await cropRegion(src, { x: 0.25, y: 0.5, w: 0.5, h: 0.5 }, "png", 30_000);
+		assert.ok(out, "expected a cropped file");
+		const buf = await readFile(out!);
+		assert.deepEqual(pngDims(buf), [250, 150]);
 	} finally {
 		await rm(src.split("/").slice(0, -1).join("/"), { recursive: true });
 	}
 });
 
-test("cropRegionToPng clamps an overflowing box to the raster", async () => {
+test("cropRegion clamps an overflowing box to the raster", async () => {
 	const src = await makePng(400, 300, "blue");
 	try {
 		// w=1,h=1 at (0.9,0.9) would overflow; must clamp inside bounds without error.
-		const buf = await cropRegionToPng(src, { x: 0.9, y: 0.9, w: 1, h: 1 }, 30_000);
-		assert.ok(buf, "expected a cropped buffer");
+		const out = await cropRegion(src, { x: 0.9, y: 0.9, w: 1, h: 1 }, "png", 30_000);
+		assert.ok(out, "expected a cropped file");
+		const buf = await readFile(out!);
 		// W=400,H=300 -> fills the whole raster from (0,0) after clamping.
-		assert.deepEqual(pngDims(buf as Buffer), [400, 300]);
+		assert.deepEqual(pngDims(buf), [400, 300]);
 	} finally {
 		await rm(src.split("/").slice(0, -1).join("/"), { recursive: true });
 	}
 });
 
-test("cropRegionToPng returns null (no throw) when dimensions cannot be resolved", async () => {
-	const buf = await cropRegionToPng("/tmp/__does_not_exist_zoom__.png", { x: 0, y: 0, w: 0.5, h: 0.5 }, 5_000);
-	assert.equal(buf, null);
+test("cropRegion returns null (no throw) when dimensions cannot be resolved", async () => {
+	const out = await cropRegion("/tmp/__does_not_exist_zoom__.png", { x: 0, y: 0, w: 0.5, h: 0.5 }, "png", 5_000);
+	assert.equal(out, null);
 });
 
-test("direct image with zoom routes through the resize pipeline (crop then pi)", async () => {
+test("direct image with zoom: crop then gate returns an image block", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "zoom-img-"));
-	// Generate a real PNG directly into dir; readExtended will crop it then hand it to pi.
 	const file = await makePng(200, 150, "green", dir);
 
-	// Zoom routes the cropped region through processImageBytes (crop -> pi pipeline).
-	await expectRoutedThroughPipeline(
-		readExtended({ path: file, zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } }, { cwd: dir, modelId: "test" }, config),
+	const result = await readExtended(
+		{ path: file, zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } },
+		{ cwd: dir, modelId: "test" },
+		config,
 	);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string }[]).filter((b) => b.type === "image");
+	assert.ok(images.length >= 1, "expected an image block");
 
 	await rm(dir, { recursive: true });
 });
 
-test("PDF image mode with zoom routes the cropped region through pi", async () => {
+test("PDF image mode with zoom: crop then gate returns an image block", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "zoom-pdf-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\nendobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\nendobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
-	);
 	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
+	await writeFile(file, PDF_BYTES);
 
-	// Renders page raster -> crops region via ffmpeg -> processImageBytes(cropped) -> pi.
-	await expectRoutedThroughPipeline(
-		readExtended({ path: file, mode: "image", zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } }, { cwd: dir, modelId: "test" }, config),
+	const result = await readExtended(
+		{ path: file, mode: "image", zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } },
+		{ cwd: dir, modelId: "test" },
+		config,
 	);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string }[]).filter((b) => b.type === "image");
+	assert.ok(images.length >= 1, "expected an image block");
 
 	await rm(dir, { recursive: true });
 });
 
-test("PDF image mode without zoom is unchanged (full page, no pipeline resize)", async () => {
+test("PDF image mode without zoom: full page image block", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "zoom-pdf-full-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\nendobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\nendobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
-	);
 	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
+	await writeFile(file, PDF_BYTES);
 
-	// Backward-compat: omitting zoom keeps the original full-page behavior — a full-page image block is returned (no pipeline resize).
 	const result = await readExtended({ path: file, mode: "image" }, { cwd: dir, modelId: "test" }, config);
 	assert.ok(result.isError !== true);
-	const blocks = result.content as any[];
+	const blocks = result.content as { type: string }[];
 	assert.ok(blocks.some((b) => b.type === "image"));
-	assert.match(text(blocks), /DPI/);
+	assert.match(text(result.content), /DPI/);
 
 	await rm(dir, { recursive: true });
 });
 
-test("converted image (tiff) with zoom routes through the resize pipeline (ffmpegConvert -> crop -> pi)", async () => {
+test("converted image (tiff) with zoom: convert, crop, gate", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "zoom-conv-"));
-	// Generate a real TIFF into dir; ffmpegConvert down-converts it to PNG, then zoom crops that raster and hands it to pi.
 	const bin = (await import("@ffmpeg-installer/ffmpeg")).path;
 	const file = join(dir, "gen.tif");
 	await new Promise<void>((res, rej) => {
 		execFile(bin, ["-y", "-f", "lavfi", "-i", `color=c=green:s=200x150`, "-frames:v", "1", file], { timeout: 20_000 }, (err) => (err ? rej(err) : res()));
 	});
 
-	// Convertible formats were previously zoom-blind; this asserts the crop path now runs for them too.
-	await expectRoutedThroughPipeline(
-		readExtended({ path: file, zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } }, { cwd: dir, modelId: "test" }, config),
+	const result = await readExtended(
+		{ path: file, zoom: { x: 0, y: 0, w: 0.5, h: 0.5 } },
+		{ cwd: dir, modelId: "test" },
+		config,
 	);
+	assert.equal(result.isError, undefined);
+	const images = (result.content as { type: string }[]).filter((b) => b.type === "image");
+	assert.ok(images.length >= 1, "expected an image block");
 
 	await rm(dir, { recursive: true });
 });
 
-test("PDF image mode with an overflowing zoom emits the fallback signal and returns the full page", async () => {
+test("PDF image mode with an overflowing zoom emits the fallback hint and returns the full page", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "zoom-pdf-fallback-"));
-	const pdfBytes = Buffer.from(
-		"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>\nendobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>\nendobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n166\n%%EOF\n",
-	);
 	const file = join(dir, "test.pdf");
-	await writeFile(file, pdfBytes);
+	await writeFile(file, PDF_BYTES);
 
-	// w=2,h=2 overflows the raster; ffmpeg's crop fails, so the crop path falls back to the full page.
-	// The fallback must be model-visible (not a silent server-side warn) so it does not hallucinate a cropped region.
+	// w=2,h=2 overflows the raster; the crop falls back to the full page.
 	const result = await readExtended({ path: file, mode: "image", zoom: { x: 0, y: 0, w: 2, h: 2 } }, { cwd: dir, modelId: "test" }, config);
 	assert.equal(result.isError, undefined);
-	const blocks = result.content as any[];
-	const hintIdx = blocks.findIndex((b) => b.type === "text" && /unavailable/i.test(b.text));
+	const blocks = result.content as { type: string; text?: string }[];
+	const hintIdx = blocks.findIndex((b) => b.type === "text" && /unavailable/i.test(b.text ?? ""));
 	const imgIdx = blocks.findIndex((b) => b.type === "image");
 	assert.notEqual(hintIdx, -1, "expected the model-visible zoom-unavailable fallback hint");
 	assert.notEqual(imgIdx, -1, "expected a full-page image block");
-	// The caveat must precede the (full-page) image it qualifies — otherwise the model would read an uncropped frame.
 	assert.ok(hintIdx < imgIdx, "fallback hint should appear before the image block it qualifies");
 
 	await rm(dir, { recursive: true });
 });
 
-// --- Probe (info=true) tests ---
-
-import { parseFfmpegProbe, renderProbeText } from "../src/ffmpeg.js";
+// --- Probe (info=true) ---
 
 const PROBE_FIXTURE = `Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'sample.mp4':
   Metadata:
@@ -675,64 +694,49 @@ test("renderProbeText marks unavailable probe", () => {
 	assert.match(lines.join("\n"), /probe unavailable/);
 });
 
-/** Generate a tiny mp4 with video + audio via ffmpeg lavfi (self-contained fixture). */
-function genMp4(file: string): Promise<void> {
-	return import("@ffmpeg-installer/ffmpeg").then(({ path: bin }) => {
-		return new Promise((res, rej) => {
-			execFile(
-				bin,
-				["-y", "-f", "lavfi", "-i", "testsrc=size=64x48:duration=1", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-shortest", file],
-				{ timeout: 20_000 },
-				(err) => (err ? rej(err) : res()),
-			);
-		});
-	});
-}
-
 test("info=true probes a real mp4 without loading media", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "extread-"));
 	const file = join(dir, "probe.mp4");
-	await genMp4(file);
+	await genMp4(file, 1);
 
 	const result = await readExtended(
 		{ path: file, info: true },
 		{ cwd: dir, modelId: "test" },
 		config,
 	);
-	const t = text(result.content as any);
+	const t = text(result.content);
 	assert.match(t, /Probe \[mp4\]/);
 	assert.match(t, /duration:/);
 	assert.match(t, /\(64x48\)/);
-	assert.match(t, /Audio: present/);
 
 	await rm(dir, { recursive: true });
 });
 
-test("info=true bypasses size cap and capability gate", async () => {
+test("info=true bypasses capability gate", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "extread-"));
 	const file = join(dir, "probe.mp4");
-	await genMp4(file);
+	await genMp4(file, 1);
 
-	// Tiny video cap + text-only model: full load would be blocked; probe must succeed.
+	// Text-only model: full load is blocked by the capability gate; probe must succeed.
 	const tight: PluginConfig = {
 		models: {
-			"text-model": { input: ["text"], maxBytes: { image: 10, audio: 10, video: 500 } },
+			"text-model": { input: ["text"], maxBytes: { image: 10 } },
 		},
 		defaults: {
-			input: ["text", "image", "audio", "video"],
-			maxBytes: { image: 10485760, audio: 20971520, video: 52428800 },
+			input: ["text", "image"],
+			maxBytes: { image: 10485760 },
 			executionMode: "parallel",
 			ffmpegTimeoutMs: 30000,
 		},
 	};
 
 	const full = await readExtended({ path: file }, { cwd: dir, modelId: "text-model" }, tight);
-	assert.match(text(full.content as any), /too large|does not support/);
+	assert.match(text(full.content), /does not support images/);
 
 	const probe = await readExtended({ path: file, info: true }, { cwd: dir, modelId: "text-model" }, tight);
-	const t = text(probe.content as any);
+	const t = text(probe.content);
 	assert.match(t, /\(64x48\)/);
-	assert.ok(!/too large|does not support/.test(t));
+	assert.ok(!/does not support/.test(t));
 
 	await rm(dir, { recursive: true });
 });
@@ -743,7 +747,7 @@ test("info=true on PDF points to toc/pages", async () => {
 	await writeFile(file, "%PDF-1.4\n");
 
 	const result = await readExtended({ path: file, info: true }, { cwd: dir, modelId: "test" }, config);
-	assert.match(text(result.content as any), /toc=true\/pages/);
+	assert.match(text(result.content), /toc=true\/pages/);
 
 	await rm(dir, { recursive: true });
 });

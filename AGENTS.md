@@ -6,38 +6,38 @@ Every change has a model-facing surface (what the tool advertises to the LLM), a
 
 ```
 src/index.ts        registerTool: promptSnippet, description, promptGuidelines, TypeBox parameters
-src/readExtended.ts dispatch spine + format maps (IMAGE_DIRECT/CONVERT, AUDIO_*, VIDEO_*)
-src/config.ts       config.json types + defaults; userConfigPath()
-src/ffmpeg.ts       ffmpeg helpers: convert, crop, dims, probe (parseFfmpegProbe/probeMedia/renderProbeText), ZOOM_UNAVAILABLE_HINT
-src/image.ts        processImageBytes (wraps pi's Photon pipeline)
+src/readExtended.ts dispatch spine + format maps (IMAGE_DIRECT/CONVERT, VIDEO_EXTS, AUDIO_EXTS)
+src/config.ts       config.json types + defaults (GateOptions); userConfigPath()
+src/ffmpeg.ts       ffmpeg helpers: runFfmpeg, cropRegion, dims, probe (parseFfmpegProbe/probeMedia/renderProbeText), ZOOM_UNAVAILABLE_HINT
+src/gate.ts         the ffmpeg image gate (pass-through / re-encode / JPEG, quality ladder, autorotate probe)
+src/video.ts        video → evenly spaced JPEG frames (auto frame count, legend)
 src/pdf.ts          PDF text/pages/toc/search/image mode (+zoom on first page); PdfParams carries all params
 src/pptx.ts         PPTX → PDF via @s8fy/pptx-converter, delegates to pdf.ts
-src/patch/targets.ts  patch anchors; src/patch/index.ts applies them + /extended-read-patch
-test/readExtended.test.ts  unit tests (pure parsers, tile math, routing)
+test/readExtended.test.ts  unit tests (pure parsers, gate, frames, routing)
 ```
 
-Dependency DAG: `ffmpeg → image → pdf → pptx → readExtended`. No cycles. New code goes into the module that owns its job; a new concern gets its own file and an entry in SPEC §9.
+Dependency DAG: `ffmpeg → gate → video → readExtended`; `ffmpeg → pdf → pptx`. No cycles. New code goes into the module that owns its job; a new concern gets its own file and an entry in SPEC §8.
 
 ## Update matrix — change type ⇒ files to touch
 
 | Change | Must update |
 | --- | --- |
-| Tool param added/renamed | `src/index.ts` schema + the param's description text; README per-modality tables (`Image reading`, `Video reading`, `PDF reading`) + Metadata probe section when relevant; SPEC §4 tool-definition table; tests. |
+| Tool param added/renamed | `src/index.ts` schema + the param's description text; README per-modality tables (`Image gate`, `Video reading`, `PDF reading`) + Metadata probe section when relevant; SPEC §4 tool-definition block; tests. |
 | Tool param semantics changed | owning module (`readExtended.ts` or the format handler); SPEC §5 dispatch steps; README row for that param; routing tests. |
 | Dispatch/routing behavior | owning module (usually `readExtended.ts`); SPEC §5 numbered steps verbatim; README rows describing the new behavior; routing tests. |
-| New capability/format/modality | format maps in `readExtended.ts`; SPEC §1 goal bullets, §6 format matrix + pipeline subsection, §9 structure if a file is added; README intro capability list + modality table row(s); tests. Move the item out of SPEC §14 (Future work) when implemented. |
-| Config knob | `src/config.ts` types+defaults, repo `config.json` **values and `$docs` entries** (self-documenting), SPEC §3 defaults block, README Configuration section; default/parse tests. |
-| ffmpeg pipeline (probe/crop/convert) | `src/ffmpeg.ts`; SPEC §6 relevant subsection (+§7 wire format only if serialization changes); live smoke below. |
-| Pi patch target | `src/patch/targets.ts`; PATCHES.md table; SPEC §8 targets table; sentinel version bump on anchor change; `test/patch.test.ts`. |
+| New capability/format/modality | format maps in `readExtended.ts`; SPEC §1 goal bullets, §6 format matrix + pipeline subsection, §8 structure if a file is added; README intro capability list + modality table row(s); tests. Move the item out of SPEC §13 (Future work) when implemented. |
+| Config knob | `src/config.ts` types+defaults, repo `config.json` **values and `$docs` entries** (self-documenting), SPEC §3 block, README Configuration section; default/parse tests. |
+| ffmpeg pipeline (probe/crop/convert) | `src/ffmpeg.ts`; SPEC §6 relevant subsection; live smoke below. |
+| Gate behavior (pass-through/re-encode/JPEG/ladder) | `src/gate.ts`; SPEC §6 image-gate subsection; README Image gate section; gate tests. |
+| Video frame behavior (auto count, legend, captions) | `src/video.ts`; SPEC §6 video-frames subsection; README Video reading section; frame tests. |
 | Model-facing text only (guidance) | the `promptGuidelines` bullets in `src/index.ts` (≤6); tool description + param descriptions carry mechanics. Do not add a skill — see steering rules below. |
-| Model-facing result notes (steering text in tool output) | owning module — notes live in dispatch code (`readExtended.ts`, `pdf.ts`), not in `index.ts`. These strings are the model's only window into config (capability gate, size cap, pagination) and the discovery path for escape hatches: when a new option lands (e.g. `frames=N`), update the dead-end notes to steer to it. Tests pin note wording. |
+| Model-facing result notes (steering text in tool output) | owning module — notes live in dispatch code (`readExtended.ts`, `pdf.ts`, `gate.ts`, `video.ts`), not in `index.ts`. These strings are the model's only window into config (capability gate, size cap, gate limits, pagination) and the discovery path for escape hatches: when a new option lands (e.g. `frames=N`), update the dead-end notes to steer to it. Tests pin note wording. |
 
 **Catch-all:** if a change matches no row, derive the row: list every surface that describes the changed behavior — model-facing (tool description, param descriptions, `promptGuidelines`, result notes) and user/repo-facing (README, SPEC, config `$docs`) — plus the code and tests that implement it. Any observable behavior change touches at least one surface in each column; if you can't name one, ask "who else needs to know about this change?" and add a row for the change type so the next session doesn't derive it again.
 
 ## Canonical facts that must agree everywhere
 
-- Size caps, dpi, maxPagesPerCall, ffmpegTimeoutMs: identical numbers in `src/config.ts` defaults, repo `config.json` values **and** its `$docs` text, SPEC §3 block, README Configuration section.
-- Patch targets: one table lives in `src/patch/targets.ts`; copies must match in PATCHES.md, SPEC §8, README Pi patches section (same count of targets).
+- Size caps, gate limits, dpi, maxPagesPerCall, ffmpegTimeoutMs: identical numbers in `src/config.ts` defaults, repo `config.json` values **and** its `$docs` text, SPEC §3 block, README Configuration section.
 - `ZOOM_UNAVAILABLE_HINT` has a single source (`ffmpeg.ts`); import it, never re-inline the wording.
 - Capability summary: README intro list == GitHub repo description == tool description. Update all three when modality support changes.
 
@@ -71,7 +71,7 @@ Guidance must be unconditional: short `promptGuidelines` bullets (≤6) in `src/
 
 ## Design constraints
 
-Zero new heavy dependencies by default (bundled ffmpeg + mupdf WASM + Photon only). No CV/ML deps: region handling stays an ffmpeg crop (`zoom`); region-finding v2 (trace) is future work (SPEC §14) — needs explicit design sign-off.
+Zero new heavy dependencies by default (bundled ffmpeg + mupdf WASM only). No CV/ML deps: region handling stays an ffmpeg crop (`zoom`); region-finding v2 (trace) is future work (SPEC §13) — needs explicit design sign-off.
 
 ## Git & PR flow
 

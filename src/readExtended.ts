@@ -1,15 +1,16 @@
 /**
  * readExtended.ts — extendedRead tool implementation.
  *
- * Model-invoked tool that reads media files (images, audio, video, PDF, PPTX)
- * and returns them as content blocks in the tool result. Mirrors the native
+ * Model-invoked tool that reads media files (images, video, PDF, PPTX) and
+ * returns them as content blocks in the tool result. Mirrors the native
  * `read` tool's flow: resolve → stat → size cap → capability gate → dispatch.
  *
  * Dispatch delegates to specialized modules:
- *   - ffmpeg.ts  — format conversion, region cropping, dimension probing
- *   - image.ts   — pi's Photon resize pipeline
- *   - pdf.ts     — mupdf text/image extraction
- *   - pptx.ts    — PPTX → PDF conversion
+ *   - ffmpeg.ts — format conversion, region cropping, dimension probing
+ *   - gate.ts   — the ffmpeg image gate (replaces pi's Photon pipeline)
+ *   - video.ts  — video → evenly spaced JPEG frames
+ *   - pdf.ts    — mupdf text/image extraction
+ *   - pptx.ts   — PPTX → PDF conversion
  */
 
 import { stat, readFile, unlink } from "node:fs/promises";
@@ -17,12 +18,23 @@ import { resolve, extname } from "node:path";
 import { homedir } from "node:os";
 
 import type { PluginConfig } from "./config.js";
-import { resolveModelConfig } from "./config.js";
-import { ffmpegConvert, probeMedia, renderProbeText } from "./ffmpeg.js";
-import { processImageBytes } from "./image.js";
-import { cropRegionToPng, ZOOM_UNAVAILABLE_HINT } from "./ffmpeg.js";
+import { resolveModelConfig, resolveGateOptions } from "./config.js";
+import { probeMedia, renderProbeText, cropRegion, ZOOM_UNAVAILABLE_HINT } from "./ffmpeg.js";
+import { gateImageFile, type GatedImage } from "./gate.js";
+import { readVideoFrames } from "./video.js";
 import { readPdf } from "./pdf.js";
 import { readPptx } from "./pptx.js";
+
+// --- Types ---
+
+export interface AgentToolResult {
+	content: (
+		| { type: "text"; text: string }
+		| { type: "image"; data: string; mimeType: string }
+	)[];
+	details?: unknown;
+	isError?: boolean;
+}
 
 // --- Format maps ---
 
@@ -35,41 +47,18 @@ const IMAGE_DIRECT: Record<string, string> = {
 	bmp: "image/bmp",
 };
 
+/** Source MIME for converted (non-native) image formats. */
 const IMAGE_CONVERT: Record<string, string> = {
-	heic: "png",
-	heif: "png",
-	tiff: "png",
-	tif: "png",
-	tga: "png",
-	avif: "png",
+	heic: "image/heic",
+	heif: "image/heif",
+	tiff: "image/tiff",
+	tif: "image/tiff",
+	tga: "image/tga",
+	avif: "image/avif",
 };
 
-const AUDIO_DIRECT: Record<string, string> = {
-	wav: "audio/wav",
-	mp3: "audio/mpeg",
-	flac: "audio/flac",
-	ogg: "audio/ogg",
-	aiff: "audio/aiff",
-	aif: "audio/aiff",
-};
-
-const AUDIO_CONVERT: Record<string, string> = {
-	m4a: "mp3",
-	aac: "mp3",
-	wma: "mp3",
-	opus: "mp3",
-};
-
-const VIDEO_DIRECT: Record<string, string> = {
-	mp4: "video/mp4",
-};
-
-const VIDEO_CONVERT: Record<string, string> = {
-	webm: "mp4",
-	mkv: "mp4",
-	mov: "mp4",
-	avi: "mp4",
-};
+const VIDEO_EXTS = new Set(["mp4", "webm", "mkv", "mov", "avi"]);
+const AUDIO_EXTS = new Set(["wav", "mp3", "flac", "ogg", "aiff", "aif", "m4a", "aac", "wma", "opus"]);
 
 // --- Helpers ---
 
@@ -77,11 +66,32 @@ function expandTilde(path: string): string {
 	return path.startsWith("~") ? path.replace(/^~/, homedir()) : path;
 }
 
-function modalityOf(ext: string): "image" | "audio" | "video" | undefined {
+function modalityOf(ext: string): "image" | "audio" | "video" | null {
 	if (ext in IMAGE_DIRECT || ext in IMAGE_CONVERT) return "image";
-	if (ext in AUDIO_DIRECT || ext in AUDIO_CONVERT) return "audio";
-	if (ext in VIDEO_DIRECT || ext in VIDEO_CONVERT) return "video";
-	return undefined;
+	if (VIDEO_EXTS.has(ext)) return "video";
+	if (AUDIO_EXTS.has(ext)) return "audio";
+	return null;
+}
+
+/** Direct-format → crop extension (animated gif flattens to first frame). */
+function cropExtFor(mime: string): string {
+	switch (mime) {
+		case "image/png":
+		case "image/gif":
+			return "png";
+		case "image/jpeg":
+			return "jpg";
+		case "image/webp":
+			return "webp";
+		case "image/bmp":
+			return "bmp";
+		default:
+			return "png";
+	}
+}
+
+function mimeForExt(ext: string): string {
+	return ext === "jpg" ? "image/jpeg" : `image/${ext}`;
 }
 
 // --- Types ---
@@ -96,8 +106,10 @@ export interface ExtendedReadParams {
 	search?: string;
 	/** PDF: DPI for image mode (overrides config default). Range: 72–600. */
 	dpi?: number;
-	/** Crop + scale a rectangular region on any image — direct formats (png,jpg,gif,webp,bmp), converted formats (heic,tiff,tif,avif,...) and PDF image mode. Normalized [x,y,w,h] fractions 0–1 of the bounding box; omit for full frame. */
+	/** Crop + scale a rectangular region on any image — direct or converted formats and PDF image mode. Normalized [x,y,w,h] fractions 0–1 of the bounding box; omit for full frame. */
 	zoom?: { x: number; y: number; w: number; h: number };
+	/** Number of frames to extract from a video (1-16). Omit for auto (~1 per 5s of duration). */
+	frames?: number;
 	/** Metadata-only first look (size, duration, dimensions, audio streams) on ffmpeg-decodable media — no media loaded. */
 	info?: boolean;
 }
@@ -107,43 +119,49 @@ export interface ExtendedReadContext {
 	modelId: string;
 }
 
-export interface AgentToolResult {
-	content: { type: string; text?: string; data?: string; mimeType?: string }[];
-	details?: unknown;
-	isError?: boolean;
-}
-
 // --- Shared image handler ---
 
 /**
- * Process image bytes with optional zoom crop, returning content blocks.
- * Shared by direct and convert image handlers.
+ * Gate an image file (with optional zoom crop first), returning content
+ * blocks. Shared by direct and converted image handlers.
+ *
+ * @param target "same" for direct formats (pass through / re-encode in own
+ *   format), "jpeg" for derived rasters (converted formats).
  */
 async function processImageContent(
-	bytes: Buffer,
-	mime: string,
+	path: string,
+	sourceMime: string,
+	target: "same" | "jpeg",
 	zoom: { x: number; y: number; w: number; h: number } | undefined,
-	inputPath: string,
-	timeoutMs: number,
-): Promise<{ content: { type: string; text?: string; data?: string; mimeType?: string }[] }> {
-	const zoomHints: string[] = [];
-	let finalBytes = bytes;
-	let finalMime = mime;
+	config: PluginConfig,
+): Promise<{ content: AgentToolResult["content"] }> {
+	const timeoutMs = config.defaults.ffmpegTimeoutMs;
+	const gateOpts = resolveGateOptions(config);
+	const notes: string[] = [];
+	let image: GatedImage | null = null;
+
 	if (zoom) {
-		const cropped = await cropRegionToPng(inputPath, zoom, timeoutMs);
+		const targetExt = target === "same" ? cropExtFor(sourceMime) : "jpg";
+		const cropped = await cropRegion(path, zoom, targetExt, timeoutMs);
 		if (cropped) {
-			finalBytes = cropped;
-			finalMime = "image/png";
+			image = await gateImageFile(cropped, mimeForExt(targetExt), target, gateOpts, timeoutMs);
+			await unlink(cropped).catch(() => {});
 		} else {
-			zoomHints.push(ZOOM_UNAVAILABLE_HINT);
+			notes.push(ZOOM_UNAVAILABLE_HINT);
 		}
 	}
-	const { data, mimeType } = await processImageBytes(finalBytes, finalMime);
+	if (!image) image = await gateImageFile(path, sourceMime, target, gateOpts, timeoutMs);
+	if (!image) {
+		// Gate unavailable (no ffmpeg / probe failed): raw bytes, no resize.
+		const bytes = await readFile(path);
+		image = { data: bytes.toString("base64"), mimeType: sourceMime, notes: ["image gate unavailable — raw bytes"] };
+	}
 	return {
 		content: [
-			{ type: "text", text: `Read image [${mimeType}]` },
-			...zoomHints.map((h) => ({ type: "text" as const, text: h })),
-			{ type: "image", data, mimeType },
+			{ type: "text", text: `Read image [${sourceMime}]` },
+			...notes.map((h) => ({ type: "text" as const, text: h })),
+			...image.notes.map((n) => ({ type: "text" as const, text: n })),
+			{ type: "image", data: image.data, mimeType: image.mimeType },
 		],
 	};
 }
@@ -175,13 +193,16 @@ export async function readExtended(
 		};
 	}
 
+	const ext = extname(path).toLowerCase().slice(1);
+	const modality = modalityOf(ext);
+	const modelCfg = resolveModelConfig(config, ctx.modelId);
+	const input = modelCfg.input;
+
 	// 3. Info probe: metadata-only first look for ffmpeg-decodable media.
 	// Runs before the size cap and capability gate so a large file can be
 	// inspected before deciding how to load it; result is plain text.
-	const ext = extname(path).toLowerCase().slice(1);
 	if (params.info) {
-		const m = modalityOf(ext);
-		if (!m)
+		if (!modality)
 			return {
 				content: [
 					{
@@ -194,130 +215,69 @@ export async function readExtended(
 		return { content: renderProbeText(info, size, ext).map((t) => ({ type: "text", text: t })) };
 	}
 
-	// 4. Size cap (per-modality)
-	const modality = modalityOf(ext);
-	const modelCfg = resolveModelConfig(config, ctx.modelId);
-	if (modality && size > modelCfg.maxBytes[modality]) {
+	// 4. Audio: support removed — probe-only (info=true) remains.
+	if (modality === "audio") {
 		return {
 			content: [
 				{
 					type: "text",
-					text: `File too large (${size} > ${modelCfg.maxBytes[modality]} bytes for ${modality})`,
+					text: `Audio [${ext}] ${size} bytes — audio support removed; probe with info=true for metadata`,
 				},
 			],
 		};
 	}
 
-	// 5. Capability gate
-	const input = modelCfg.input;
+	// 5. Video: read as evenly spaced JPEG frames (bypasses the size cap).
+	if (modality === "video") {
+		if (!input.includes("image"))
+			return {
+				content: [{ type: "text", text: "Model does not support images (required for video frames)" }],
+			};
+		const result = await readVideoFrames(path, ext, size, params.frames, resolveGateOptions(config), config.defaults.ffmpegTimeoutMs);
+		if (!result)
+			return {
+				content: [{ type: "text", text: `Video [${ext}] ${size} bytes — frame extraction failed (ffmpeg)` }],
+			};
+		const blocks: AgentToolResult["content"] = [...result.notes.map((n) => ({ type: "text" as const, text: n })), { type: "text", text: result.legend }];
+		for (const f of result.frames) {
+			blocks.push({ type: "text", text: f.caption });
+			blocks.push({ type: "image", data: f.data, mimeType: f.mimeType });
+		}
+		return { content: blocks };
+	}
 
-	// 5. Dispatch
-	// --- Image direct ---
+	// 6. Size cap (images only — video bypasses, audio is probe-only).
+	if (modality === "image" && size > modelCfg.maxBytes.image) {
+		return {
+			content: [{ type: "text", text: `File too large (${size} > ${modelCfg.maxBytes.image} bytes for image)` }],
+		};
+	}
+
+	// 7. Capability gate (images).
+	if (!input.includes("image")) {
+		return {
+			content: [{ type: "text", text: "Model does not support images" }],
+		};
+	}
+
+	// 8. Image direct: native format — pass through within limits,
+	// re-encode in own format over limits.
 	if (ext in IMAGE_DIRECT) {
-		if (!input.includes("image"))
-			return {
-				content: [{ type: "text", text: "Model does not support images" }],
-			};
-		const bytes: Buffer = await readFile(path);
-		return processImageContent(bytes, IMAGE_DIRECT[ext], params.zoom, path, config.defaults.ffmpegTimeoutMs);
+		return processImageContent(path, IMAGE_DIRECT[ext], "same", params.zoom, config);
 	}
 
-	// --- Image convertible ---
+	// 9. Image converted: non-native format — gate to JPEG.
 	if (ext in IMAGE_CONVERT) {
-		if (!input.includes("image"))
-			return {
-				content: [{ type: "text", text: "Model does not support images" }],
-			};
-		const tmp = await ffmpegConvert(path, "png", config.defaults.ffmpegTimeoutMs);
-		try {
-			const bytes: Buffer = await readFile(tmp);
-			return processImageContent(bytes, "image/png", params.zoom, tmp, config.defaults.ffmpegTimeoutMs);
-		} finally {
-			await unlink(tmp).catch(() => {});
-		}
+		return processImageContent(path, IMAGE_CONVERT[ext], "jpeg", params.zoom, config);
 	}
 
-	// --- Audio direct ---
-	if (ext in AUDIO_DIRECT) {
-		if (!input.includes("audio"))
-			return {
-				content: [{ type: "text", text: "Model does not support audio" }],
-			};
-		const b64 = (await readFile(path)).toString("base64");
-		return {
-			content: [
-				{ type: "text", text: `Read audio [${AUDIO_DIRECT[ext]}]` },
-				{ type: "audio", data: b64, mimeType: AUDIO_DIRECT[ext] },
-			],
-		};
-	}
+	// 10. PDF
+	if (ext === "pdf") return readPdf(path, params, config, input);
 
-	// --- Audio convertible ---
-	if (ext in AUDIO_CONVERT) {
-		if (!input.includes("audio"))
-			return {
-				content: [{ type: "text", text: "Model does not support audio" }],
-			};
-		const tmp = await ffmpegConvert(path, "mp3", config.defaults.ffmpegTimeoutMs);
-		try {
-			const b64 = (await readFile(tmp)).toString("base64");
-			return {
-				content: [
-					{ type: "text", text: "Read audio [audio/mpeg]" },
-					{ type: "audio", data: b64, mimeType: "audio/mpeg" },
-				],
-			};
-		} finally {
-			await unlink(tmp).catch(() => {});
-		}
-	}
+	// 11. PPTX (convert to PDF via @s8fy/pptx-converter)
+	if (ext === "pptx") return readPptx(path, params, config, input);
 
-	// --- Video direct ---
-	if (ext in VIDEO_DIRECT) {
-		if (!input.includes("video"))
-			return {
-				content: [{ type: "text", text: "Model does not support video" }],
-			};
-		const b64 = (await readFile(path)).toString("base64");
-		return {
-			content: [
-				{ type: "text", text: `Read video [${VIDEO_DIRECT[ext]}]` },
-				{ type: "video", data: b64, mimeType: VIDEO_DIRECT[ext] },
-			],
-		};
-	}
-
-	// --- Video convertible ---
-	if (ext in VIDEO_CONVERT) {
-		if (!input.includes("video"))
-			return {
-				content: [{ type: "text", text: "Model does not support video" }],
-			};
-		const tmp = await ffmpegConvert(path, "mp4", config.defaults.ffmpegTimeoutMs);
-		try {
-			const b64 = (await readFile(tmp)).toString("base64");
-			return {
-				content: [
-					{ type: "text", text: "Read video [video/mp4]" },
-					{ type: "video", data: b64, mimeType: "video/mp4" },
-				],
-			};
-		} finally {
-			await unlink(tmp).catch(() => {});
-		}
-	}
-
-	// --- PDF ---
-	if (ext === "pdf") {
-		return readPdf(path, params, config, input);
-	}
-
-	// --- PPTX (convert to PDF via @s8fy/pptx-converter) ---
-	if (ext === "pptx") {
-		return readPptx(path, params, config, input);
-	}
-
-	// --- Unsupported ---
+	// 12. Unsupported
 	return {
 		content: [{ type: "text", text: `[extendedRead: unsupported format ${ext}]` }],
 	};

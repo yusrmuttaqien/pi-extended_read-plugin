@@ -10,22 +10,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { PluginConfig } from "./config.js";
-import { cropRegionToPng, ZOOM_UNAVAILABLE_HINT } from "./ffmpeg.js";
-import { processImageBytes } from "./image.js";
-
-/**
- * Run rendered PNG bytes through pi's Photon pipeline (resize/normalize) so
- * every image this tool returns is bounded. Falls back to raw bytes on
- * failure — a rendered page is never lost to a pipeline hiccup.
- */
-async function boundedPng(png: Buffer): Promise<{ data: string; mimeType: string }> {
-	try {
-		return await processImageBytes(png, "image/png");
-	} catch (e) {
-		console.warn("[extendedRead] PDF image processing failed, using raw PNG:", e);
-		return { data: png.toString("base64"), mimeType: "image/png" };
-	}
-}
+import type { AgentToolResult } from "./readExtended.js";
+import { resolveGateOptions } from "./config.js";
+import { cropRegion, ZOOM_UNAVAILABLE_HINT } from "./ffmpeg.js";
+import { gateImageFile } from "./gate.js";
 
 /**
  * Read a PDF: text extraction, image rendering, TOC, search.
@@ -36,7 +24,7 @@ export async function readPdf(
 	params: { pages?: string; mode?: "text" | "image"; toc?: boolean; search?: string; dpi?: number; zoom?: { x: number; y: number; w: number; h: number } },
 	config: PluginConfig,
 	input: string[],
-): Promise<{ content: { type: string; text?: string; data?: string; mimeType?: string }[]; isError?: boolean }> {
+): Promise<{ content: AgentToolResult["content"]; isError?: boolean }> {
 	const mupdf = await import("mupdf") as any;
 	const buffer = await readFile(path);
 	const doc = mupdf.Document.openDocument(buffer, "application/pdf");
@@ -49,6 +37,7 @@ export async function readPdf(
 		}
 		const mode = params.mode ?? "text";
 		const dpi = params.dpi ?? config.defaults.pdf?.defaultDpi ?? 150;
+		const gateOpts = resolveGateOptions(config);
 
 		// --- TOC mode ---
 		if (params.toc) {
@@ -66,7 +55,7 @@ export async function readPdf(
 			};
 		}
 
-		const blocks: { type: string; text?: string; data?: string; mimeType?: string }[] = [];
+		const blocks: AgentToolResult["content"] = [];
 
 		if (mode === "text") {
 			// Text extraction
@@ -104,34 +93,29 @@ export async function readPdf(
 							type: "text",
 							text: `PDF page ${i + 1} of ${totalPages} (${dpi} DPI)`,
 						});
+						const tmpInput = join(tmpdir(), `pi-pdf-${process.pid}-${randomUUID()}.png`);
+						await writeFile(tmpInput, png);
+						let image = null;
 						if (params.zoom) {
-							try {
-								const tmpInput = join(tmpdir(), `pi-pdf-${process.pid}-${randomUUID()}.png`);
-								await writeFile(tmpInput, png);
-								const cropped = await cropRegionToPng(tmpInput, params.zoom, config.defaults.ffmpegTimeoutMs);
-								await unlink(tmpInput).catch(() => {});
-								if (cropped) {
-									const { data, mimeType } = await boundedPng(cropped);
-									blocks.push({ type: "image", data, mimeType });
-								} else {
-									blocks.push({ type: "text", text: ZOOM_UNAVAILABLE_HINT });
-									const { data, mimeType } = await boundedPng(png);
-									blocks.push({ type: "image", data, mimeType });
-								}
-							} catch (e) {
-								console.warn("[extendedRead] PDF crop failed, using full page:", e);
+							const cropped = await cropRegion(tmpInput, params.zoom, "png", config.defaults.ffmpegTimeoutMs);
+							if (cropped) {
+								image = await gateImageFile(cropped, "image/png", "jpeg", gateOpts, config.defaults.ffmpegTimeoutMs);
+								await unlink(cropped).catch(() => {});
+							} else {
 								blocks.push({ type: "text", text: ZOOM_UNAVAILABLE_HINT });
-								const { data, mimeType } = await boundedPng(png);
-								blocks.push({ type: "image", data, mimeType });
 							}
+						}
+						if (!image) image = await gateImageFile(tmpInput, "image/png", "jpeg", gateOpts, config.defaults.ffmpegTimeoutMs);
+						await unlink(tmpInput).catch(() => {});
+						if (image) {
+							blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
 						} else {
-							const { data, mimeType } = await boundedPng(png);
-							blocks.push({ type: "image", data, mimeType });
+							// Gate unavailable — raw render, never lose the page.
+							blocks.push({ type: "image", data: png.toString("base64"), mimeType: "image/png" });
 						}
 					} finally {
 						pixmap.destroy();
-					}
-				} finally {
+					}				} finally {
 					page.destroy();
 				}
 			}
@@ -148,7 +132,7 @@ export async function readPdf(
 }
 
 /** Extract and format the PDF outline/TOC. */
-function readPdfToc(doc: any): { content: { type: string; text?: string }[] } {
+function readPdfToc(doc: any): { content: AgentToolResult["content"] } {
 	const outline = doc.loadOutline();
 	if (!outline || outline.length === 0) {
 		return {
@@ -178,8 +162,8 @@ function readPdfSearch(
 	needle: string,
 	pageIndices: number[],
 	totalPages: number,
-): { content: { type: string; text?: string }[] } {
-	const blocks: { type: string; text?: string }[] = [];
+): { content: AgentToolResult["content"] } {
+	const blocks: AgentToolResult["content"] = [];
 	let totalHits = 0;
 
 	for (const i of pageIndices) {
