@@ -25,5 +25,10 @@
 		"@earendil-works/pi-coding-agent": "^1.1.0",
 		"@types/node": "^22.0.0",
 		"typescript": "^5.5.0"
+	},
+	"allowScripts": {
+		"@ffmpeg-installer/darwin-arm64": true,
+		"@google/genai": true,
+		"protobufjs": true
 	}
 }
